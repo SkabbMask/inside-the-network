@@ -50,6 +50,8 @@ Everything shown comes from the live model.
 - Tests: `godot --xr-mode off --path godot -- --screenshot=out.png` renders a test
   picture (options are read in `_ready` in `godot/main.gd`). Keep `--xr-mode off` in tests.
 
+Youtube video of a playthrough (resolution is much better in the headset though, and this only captures one eye, so the tunnel-vision effect to reduce motion sickness looks weird in this capture): https://www.youtube.com/watch?v=0RAGd1o9CiU
+
 ## Credits
 
 MNIST (LeCun, Cortes & Burges) · network size after 3Blue1Brown · console model from

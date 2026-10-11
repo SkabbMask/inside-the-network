@@ -288,16 +288,6 @@ void fragment() {
 	_console.add_child(model)
 
 
-## Where you are and where you look, in the network's own coordinates (for choosing the
-## starting position).
-func _print_camera() -> void:
-	var cam: Node3D = _xr_cam if vr else _cam
-	var p: Vector3 = view.to_local(cam.global_position)
-	var look: Vector3 = view.to_local(cam.global_position - cam.global_basis.z * 100.0)
-	print("Camera: position %s, looking at %s (network coordinates)" % [
-		p.snapped(Vector3.ONE * 0.1), look.snapped(Vector3.ONE * 0.1)])
-
-
 ## Bring the console to just in front of you, facing you (left controller B, desktop C).
 func _summon_console() -> void:
 	var head := _head_pos()
@@ -724,10 +714,6 @@ func _set_camera_view(n: int) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
-	# P works in VR too (with the game window focused): print where you are.
-	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_P:
-		_print_camera()
-		return
 	if vr:
 		return
 	if event is InputEventMouseButton:

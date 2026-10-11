@@ -13,9 +13,22 @@ uniform float faded_alpha = 0.06;  // lines not touching the selected neuron
 uniform float pulse_t = 10.0;     // layer units: 0..1 crosses input -> layer 1, and so on
 uniform vec3 pos_col = vec3(1.0, 0.55, 0.18);
 uniform vec3 neg_col = vec3(0.25, 0.6, 1.0);
-uniform float rest_level = 0.45;  // surface colour of a line at rest, as a share of its colour
+uniform float rest_level = 0.14;  // surface colour of a line at rest, as a share of its colour
+// Each tube glows a little of its own colour, like a glow stick: less for the 12,544
+// pixel lines so their mass does not wash out. Tubes are opaque, so where they overlap
+// you only see the front one: the glow never adds up.
+uniform float glow_input = 0.25;
+uniform float glow_cable = 0.45;
 uniform float pulse_energy = 4.0; // how strongly the pulse glows
-uniform float cube = 7.0;         // neuron cube size, metres
+uniform float grid_cells = 6.0;   // wires around a tube per metre of diameter (4 to 10)
+// Slack: every line hangs and sways a little, like a loose cable floating in space. This
+// is decoration only: the curve carries no information. Ends stay fixed.
+uniform float sway_t = 0.0;       // time, set from the scene (so grabbing can follow)
+uniform float slack = 0.025;      // how far the middle of a line strays, per metre of length
+uniform float grid_line = 0.07;   // wire thickness, as a share of a grid cell
+uniform float rim_power = 3.0;    // how tightly the glow hugs a tube's silhouette
+uniform float cube = 16.0;        // width of the square connection grids on a neuron, metres
+uniform float ball = 12.0;        // radius of the neuron's glass ball, metres
 uniform float face_fill = 0.9;    // share of a cube's face used by connection points
 uniform float pixel = 12.857;     // width of one input pixel's tile, metres
 uniform float min_width = 0.05;   // smallest diameter in metres, so small weights stay visible
@@ -30,21 +43,31 @@ varying float v_flow;
 varying float v_along;
 varying float v_layer;
 varying float v_grab;
+varying float v_len;     // length of this line, metres
+varying float v_width;   // its diameter, metres
 
 vec3 node_pos(int id) {
 	return mix(texelFetch(pos_a, ivec2(id, 0), 0).rgb, texelFetch(pos_b, ivec2(id, 0), 0).rgb, blend);
 }
 
-// Where an incoming line meets its neuron's front face: the point for the sending pixel
+// Lift a point of a square connection grid (x, y) onto the ball's front (+1) or back (-1)
+// hemisphere, straight along z, so the grid keeps its layout seen from front or back.
+// Slightly inside the surface, so tube ends never poke out.
+vec3 on_ball(vec2 p, float side) {
+	float r = ball * 0.97;
+	return vec3(p, side * sqrt(max(r * r - dot(p, p), 0.0)));
+}
+
+// Where an incoming line meets its neuron's ball: the point for the sending pixel
 // (28 x 28) or the sending neuron's seat (4 x 4), laid out like the layer it comes from.
-// The layers run towards -z, so the front face is at +z.
+// The layers run towards -z, so the front is at +z.
 vec3 face_point(int layer, int src) {
 	float n = layer == 0 ? 28.0 : 4.0;
 	int i = layer == 0 ? src : (layer == 1 ? src - 784 : src - 800);
 	float c = float(i % int(n));
 	float r = float(i / int(n));
 	float s = cube * face_fill;
-	return vec3(((c + 0.5) / n - 0.5) * s, (0.5 - (r + 0.5) / n) * s, cube * 0.5);
+	return on_ball(vec2(((c + 0.5) / n - 0.5) * s, (0.5 - (r + 0.5) / n) * s), 1.0);
 }
 
 // Where an outgoing line leaves its sender: on the back of the pixel's tile or the
@@ -54,8 +77,8 @@ vec3 face_point(int layer, int src) {
 vec3 back_point(int layer, int dst) {
 	int i = layer == 0 ? dst - 784 : (layer == 1 ? dst - 800 : dst - 816);
 	float s = layer == 0 ? pixel * face_fill : cube * face_fill;
-	float z = layer == 0 ? 0.0 : -cube * 0.5;
-	return vec3(((float(i % 4) + 0.5) / 4.0 - 0.5) * s, (0.5 - (float(i / 4) + 0.5) / 4.0) * s, z);
+	vec2 p = vec2(((float(i % 4) + 0.5) / 4.0 - 0.5) * s, (0.5 - (float(i / 4) + 0.5) / 4.0) * s);
+	return layer == 0 ? vec3(p, 0.0) : on_ball(p, -1.0);
 }
 
 void vertex() {
@@ -93,8 +116,21 @@ void vertex() {
 	vec3 side = normalize(cross(fwd, up));
 	vec3 up2 = cross(side, fwd);
 	float t = max(min_width, (layer == 0 ? max_width_input : max_width) * abs(w));
+	v_len = length(dir);
+	v_width = t;
 	v_grab = abs(float(INSTANCE_ID) - grab_edge) < 0.5 ? 1.0 : 0.0;
-	vec3 local = a + dir * v_along + side * VERTEX.x * t + up2 * VERTEX.z * t;
+	// Bend the line: the middle strays by `bend`, the ends stay put (sin 0 = sin pi = 0).
+	float ph = fract(float(id) * 0.618034) * 6.2831853;
+	vec3 bend = slack * v_len * (vec3(0.0, -0.6, 0.0)
+		+ side * sin(sway_t * 0.35 + ph) * 0.8
+		+ up2 * cos(sway_t * 0.27 + ph * 1.3) * 0.8);
+	float sb = sin(PI * v_along);
+	vec3 centre = a + dir * v_along + bend * sb;
+	vec3 tang = normalize(dir + bend * PI * cos(PI * v_along));
+	vec3 up_c = abs(tang.y) > 0.95 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0);
+	side = normalize(cross(tang, up_c));
+	up2 = cross(side, tang);
+	vec3 local = centre + side * VERTEX.x * t + up2 * VERTEX.z * t;
 	if (skip) {
 		local = vec3(0.0);  // all corners in one point: nothing is drawn in this pass
 	}
@@ -110,11 +146,31 @@ void fragment() {
 	// still shows which connections carried your drawing.
 	float since = u - v_along;
 	float passed = smoothstep(0.0, 0.02, since) * (0.05 + 0.3 * exp(-since * 2.5));
-	float glow = v_flow * clamp(front * 1.4 + passed, 0.0, 1.4);
-	ALBEDO = v_col * rest_level;
-	ROUGHNESS = 0.55;
-	SPECULAR = 0.3;
-	EMISSION = mix(v_col, vec3(1.0, 0.97, 0.9), 0.55) * clamp(glow, 0.0, 1.4) * pulse_energy
+	float head = v_flow * clamp(front * 1.4, 0.0, 1.4);
+	float trail = v_flow * passed;
+	// Neon wireframe: a near-black body, a glowing grid of rings and wires in the tube's
+	// colour, and a glowing rim along its silhouette. Grid cells are square and scale
+	// with the tube's thickness. Where a cell gets smaller than a pixel the grid fades to
+	// its average glow, so distant tubes do not shimmer.
+	// Fewer, wider-spaced wires on thin tubes; a whole number so the grid closes round.
+	float around = clamp(round(v_width * grid_cells), 4.0, 10.0);
+	float cell = PI * v_width / around;
+	vec2 g = vec2(UV.x * around, v_along * v_len / cell);
+	vec2 fw = fwidth(g);
+	vec2 d = abs(fract(g - 0.5) - 0.5);
+	vec2 lines = 1.0 - smoothstep(vec2(grid_line * 0.5), vec2(grid_line * 0.5) + fw * 1.5, d);
+	float wire = max(lines.x, lines.y);
+	float far = clamp(max(fw.x, fw.y) * 2.0 - 0.5, 0.0, 1.0);
+	wire = mix(wire, grid_line * 1.3, far);
+	float rim = pow(1.0 - clamp(dot(NORMAL, normalize(VIEW)), 0.0, 1.0), rim_power);
+	float own = (v_layer < 0.5 ? glow_input : glow_cable);
+	ALBEDO = v_col * rest_level * 0.08;
+	ROUGHNESS = 0.35;
+	SPECULAR = 0.15;
+	EMISSION = v_col * own * (wire * 2.4 + rim * 2.4 + 0.03)
+		// The pulse head burns nearly white; the trail it leaves glows in the tube's colour.
+		+ mix(v_col, vec3(1.0, 0.95, 1.0), 0.55) * head * pulse_energy
+		+ v_col * trail * pulse_energy * 0.5
 		+ v_col * v_grab * 0.8;
 #ifdef FADED_PASS
 	ALPHA = faded_alpha;

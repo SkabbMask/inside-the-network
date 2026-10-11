@@ -14,6 +14,9 @@ Client -> server (JSON text):
   {"type": "clear"}
   {"type": "toggle_neuron", "layer": 1|2, "neuron": j}
   {"type": "neuron_weights", "layer": 1, "neuron": j}
+  {"type": "nudge_weight", "edge": e, "steps": n}  change one weight by n steps of 5% of its
+                                                 layer's largest weight, at this snapshot only
+  {"type": "clear_edits"}                        undo every weight change
   {"type": "retrain"}                            record a new run from fresh random weights
   {"type": "reset"}                              back to the standard run
 
@@ -57,12 +60,24 @@ EDGE_TEX_H = (N_EDGES + EDGE_TEX_W - 1) // EDGE_TEX_W  # 102
 STANDARD_SEED = 0
 
 
+def edge_index(e):
+    """Edge number (the scene's order) -> (layer of weights, receiving neuron, sender)."""
+    if e < 12544:
+        return 0, e // 784, e % 784
+    if e < 12800:
+        return 1, (e - 12544) // 16, (e - 12544) % 16
+    return 2, (e - 12800) // 16, (e - 12800) % 16
+
+
 class State:
     def __init__(self, data, standard):
         self.data = data
         self.rec = standard
         self.index = len(standard) - 1
         self.masks = [np.ones(16, np.float32), np.ones(16, np.float32)]
+        # Weight changes made by the visitor: {snapshot index: {edge: new weight}}.
+        # Each belongs to the snapshot it was made at, so the recording itself never changes.
+        self.edits = {}
         self.canvas = None
         self.center = False
         self.x = np.zeros(784, np.float32)
@@ -77,6 +92,12 @@ class State:
 
     def net(self):
         W, b = self.rec.weights[self.index]
+        edits = self.edits.get(self.index)
+        if edits:
+            W = [w.copy() for w in W]
+            for e, v in edits.items():
+                l, j, i = edge_index(e)
+                W[l][j, i] = v
         n = model.Net.__new__(model.Net)
         n.W, n.b = W, b
         return n
@@ -123,6 +144,7 @@ class State:
             "prediction": int(out.argmax()) if drawn else None,
             "probs": [round(float(p), 4) for p in out],
             "off": [[int(i) for i in np.where(m == 0)[0]] for m in self.masks],
+            "edited": len(self.edits.get(self.index, {})),
         }
 
     def timeline_msg(self):
@@ -168,6 +190,18 @@ def make_handler(data, standard):
                     st.canvas = None
                     st.set_input()
                     await send_state(ws, st)
+                elif t == "nudge_weight":
+                    e = int(msg["edge"])
+                    if 0 <= e < N_EDGES:
+                        l, j, i = edge_index(e)
+                        snap = st.edits.setdefault(st.index, {})
+                        current = snap.get(e, float(st.rec.weights[st.index][0][l][j, i]))
+                        step = 0.05 * st.rec.weight_scale()[l]
+                        snap[e] = current + step * int(msg.get("steps", 1))
+                        await send_state(ws, st)
+                elif t == "clear_edits":
+                    st.edits = {}
+                    await send_state(ws, st)
                 elif t == "toggle_neuron":
                     m = st.masks[int(msg["layer"]) - 1]
                     j = int(msg["neuron"])
@@ -192,6 +226,7 @@ def make_handler(data, standard):
                         st.rec = standard
                         st.index = len(standard) - 1
                     st.masks = [np.ones(16, np.float32), np.ones(16, np.float32)]
+                    st.edits = {}
                     busy = False
                     await ws.send(json.dumps(st.timeline_msg()))
                     await send_state(ws, st)

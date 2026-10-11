@@ -29,7 +29,8 @@ const LABEL_PIXEL := 0.0035 * SPREAD   # text size in the network, metres per fo
 # that layer: a 28 x 28 grid for the pixels, or the 4 x 4 seats of the hidden grid. Each
 # incoming line ends at its own point there; the one outgoing value leaves from the
 # middle of the back face.
-const CUBE := 16.0
+const CUBE := 16.0      # width of the square connection grids on each neuron
+const BALL := CUBE * 0.75   # each neuron is a black glass ball; its grids sit on it
 const FACE_FILL := 1.0   # the connection points' cells tile the whole face
 # Line diameter is proportional to the weight: MAX_WIDTH for the largest weights of the
 # run, down to MIN_WIDTH, below which lines stay at MIN_WIDTH so they remain visible.
@@ -42,14 +43,15 @@ const FACE_FILL := 1.0   # the connection points' cells tile the whole face
 const MAX_WIDTH := 1.12 * CUBE / 4.0
 const MAX_WIDTH_INPUT := 1.12 * CUBE / 28.0
 const MIN_WIDTH := 0.05
-const PICK_RADIUS := CUBE * 0.8
+const PICK_RADIUS := BALL
 
-const COL_POS := Color(1.0, 0.55, 0.18)
-const COL_NEG := Color(0.25, 0.6, 1.0)
-const COL_IDLE := Color(0.16, 0.17, 0.21)
-const COL_LIT := Color(1.0, 0.96, 0.86)
+const COL_POS := Color(1.0, 0.16, 0.62)    # hot pink: pushes the next neuron on
+const COL_NEG := Color(0.12, 0.55, 1.0)    # electric blue: pushes it off
+const COL_IDLE := Color(0.09, 0.04, 0.15)
+const COL_LIT := Color(1.0, 0.86, 1.0)
 const COL_OFF := Color(0.55, 0.08, 0.12)
-const COL_TEXT := Color(0.75, 0.79, 0.86)
+const COL_TEXT := Color(0.82, 0.72, 1.0)
+const COL_FRAME := Color(0.62, 0.22, 1.0)  # the input screen's neon border
 
 var input_pos := PackedVector3Array()
 var pos_from := PackedVector3Array()   # hidden + output neurons, 42 each
@@ -155,12 +157,14 @@ func _build_input() -> void:
 	_input_img = Image.create(28, 28, false, Image.FORMAT_L8)
 	_input_tex = ImageTexture.create_from_image(_input_img)
 	var center := Vector3(0, GRID_Y, LAYER_Z[0])
+	# A huge black screen with a glowing border.
 	var border := MeshInstance3D.new()
 	var bq := QuadMesh.new()
-	bq.size = Vector2(GRID_SIZE + 0.1, GRID_SIZE + 0.1)
+	var frame := GRID_SIZE / 28.0 * 0.6
+	bq.size = Vector2(GRID_SIZE + 2 * frame, GRID_SIZE + 2 * frame)
 	border.mesh = bq
-	border.material_override = _unshaded(Color(0.22, 0.24, 0.3))
-	border.position = center - Vector3(0, 0, 0.01)
+	border.material_override = _unshaded(COL_FRAME * 1.6)
+	border.position = center - Vector3(0, 0, 0.3)
 	add_child(border)
 	var tiles := MeshInstance3D.new()
 	var q := QuadMesh.new()
@@ -181,8 +185,8 @@ func _build_edges() -> void:
 	mesh.top_radius = 0.5
 	mesh.bottom_radius = 0.5
 	mesh.height = 1.0
-	mesh.radial_segments = 10
-	mesh.rings = 0
+	mesh.radial_segments = 16
+	mesh.rings = 11   # 12 segments along each line, so it can curve
 	mesh.cap_top = false
 	mesh.cap_bottom = false
 	var mm := MultiMesh.new()
@@ -214,6 +218,7 @@ func _build_edges() -> void:
 		_pos_tex.append(ImageTexture.create_from_image(_pos_img))
 	set_edge_param("tex_w", EDGE_TEX_W)
 	set_edge_param("cube", CUBE)
+	set_edge_param("ball", BALL)
 	set_edge_param("pixel", GRID_SIZE / 28.0)
 	set_edge_param("max_width", MAX_WIDTH)
 	set_edge_param("face_fill", FACE_FILL)
@@ -221,6 +226,8 @@ func _build_edges() -> void:
 	set_edge_param("min_width", MIN_WIDTH)
 	set_edge_param("face_fill", FACE_FILL)
 	set_edge_param("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
+	set_edge_param("glow_input", 0.35)
+	set_edge_param("glow_cable", 0.6)
 	set_edge_param("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
 	_bind_textures()
 	inst.material_override = edge_mat
@@ -242,25 +249,32 @@ func _bind_textures() -> void:
 
 
 func _build_nodes() -> void:
-	var box := BoxMesh.new()
-	box.size = Vector3.ONE * CUBE
-	# Unshaded, but side faces a little darker so the cubes read as solid.
+	var sphere := SphereMesh.new()
+	sphere.radius = BALL
+	sphere.height = BALL * 2
+	sphere.radial_segments = 48
+	sphere.rings = 24
+	# Black glass: a glossy, near-black surface that reflects the stars and the tubes
+	# around it. Activation is a light inside the glass: brightest at the centre of the
+	# ball as you see it, fading to the rim, where the reflections take over.
 	var sh := Shader.new()
 	sh.code = """
 shader_type spatial;
-render_mode unshaded;
-uniform vec3 col = vec3(0.16, 0.17, 0.21);
-varying float v_shade;
-void vertex() {
-	v_shade = 0.7 + 0.3 * abs(NORMAL.z) + 0.1 * NORMAL.y;
-}
+uniform vec3 col = vec3(0.0);   // the inner light: activation (or red when switched off)
 void fragment() {
-	ALBEDO = col * v_shade;
+	float facing = clamp(dot(NORMAL, VIEW), 0.0, 1.0);
+	ALBEDO = vec3(0.005, 0.003, 0.01);
+	METALLIC = 0.0;
+	ROUGHNESS = 0.03;
+	SPECULAR = 1.0;
+	CLEARCOAT = 1.0;
+	CLEARCOAT_ROUGHNESS = 0.02;
+	EMISSION = col * pow(facing, 4.0) * 1.3;
 }
 """
 	for k in 42:
 		var mi := MeshInstance3D.new()
-		mi.mesh = box
+		mi.mesh = sphere
 		var m := ShaderMaterial.new()
 		m.shader = sh
 		mi.material_override = m
@@ -274,9 +288,9 @@ void fragment() {
 		l.font_size = 64
 		l.pixel_size = LABEL_PIXEL * 0.6
 		l.outline_size = 0
-		l.modulate = Color(0.5, 0.54, 0.6)
+		l.modulate = Color(0.55, 0.45, 0.78)
 		l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-		l.position = Vector3(0, CUBE / 2 + CUBE * 0.4, 0)
+		l.position = Vector3(0, BALL + CUBE * 0.4, 0)
 		node_inst[32 + d].add_child(l)
 		_digit_labels.append(l)
 
@@ -290,8 +304,8 @@ func _build_labels() -> void:
 		_label(names[l], Vector3(0, y, LAYER_Z[l]), 44, COL_TEXT, true)
 	_label("Each neuron keeps its place, so you can follow it. Its place in the grid means nothing: every neuron is connected to every pixel.
 Line thickness compares weights within one layer, not between layers.",
-		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, Color(0.6, 0.64, 0.72), true)
-	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, Color(0.6, 0.64, 0.72), true)
+		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, Color(0.62, 0.5, 0.85), true)
+	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, Color(0.62, 0.5, 0.85), true)
 	set_center(false)
 	_answer = _label("", Vector3(0, GRID_Y + 0.5 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 200, COL_LIT, true)
 	_answer_caption = _label("", Vector3(0, GRID_Y - 0.4 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 40, COL_TEXT, true)
@@ -341,7 +355,7 @@ render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
 uniform sampler2D canvas : filter_linear;
 void fragment() {
 	float v = clamp((texture(canvas, UV).r - 0.07) / 0.93, 0.0, 1.0);
-	ALBEDO = vec3(1.0, 0.93, 0.78);
+	ALBEDO = vec3(1.0, 0.45, 0.85);
 	ALPHA = v * 0.45;
 }
 """
@@ -364,7 +378,7 @@ func show_input(values: PackedFloat32Array) -> void:
 	var bytes := PackedByteArray()
 	bytes.resize(784)
 	for i in 784:
-		bytes[i] = int(18 + clampf(values[i], 0.0, 1.0) * 237.0)
+		bytes[i] = int(clampf(values[i], 0.0, 1.0) * 255.0)
 	_input_img.set_data(28, 28, false, Image.FORMAT_L8, bytes)
 	_input_tex.update(_input_img)
 
@@ -411,6 +425,8 @@ func pulse_done() -> bool:
 
 
 func _process(delta: float) -> void:
+	sway_t += delta
+	set_edge_param("sway_t", sway_t)
 	if pulse_t < 4.0:
 		pulse_t += delta * pulse_speed
 		set_edge_param("pulse_t", pulse_t)
@@ -474,7 +490,7 @@ func apply_meta(meta: Dictionary) -> void:
 	var pred = meta.get("prediction")
 	for i in 10:
 		var lit: bool = pred != null and int(pred) == i
-		_digit_labels[i].modulate = COL_LIT if lit else Color(0.5, 0.54, 0.6)
+		_digit_labels[i].modulate = COL_LIT if lit else Color(0.55, 0.45, 0.78)
 	if pred == null:
 		_answer.text = ""
 		_answer_caption.text = ""
@@ -497,11 +513,11 @@ func _recolor() -> void:
 		var ln := _layer_of(k)
 		var m: ShaderMaterial = node_mats[k]
 		if off[ln.x].has(ln.y):
-			m.set_shader_parameter("col", COL_OFF)
+			m.set_shader_parameter("col", COL_OFF * 0.5)
 		else:
 			# A neuron lights up when the pulse reaches its layer.
 			var arrived := smoothstep(float(ln.x) - 0.2, float(ln.x), pulse_t)
-			m.set_shader_parameter("col", COL_IDLE.lerp(COL_LIT, clampf(acts[784 + k], 0.0, 1.0) * arrived))
+			m.set_shader_parameter("col", COL_LIT * clampf(acts[784 + k], 0.0, 1.0) * arrived)
 		node_inst[k].scale = Vector3.ONE * (1.2 if selected == ln else 1.0)
 
 
@@ -535,21 +551,47 @@ func edge_ends(e: int) -> Array:
 	var n := 28 if layer == 0 else 4
 	var i := src if layer == 0 else (src - 784 if layer == 1 else src - 800)
 	var f := CUBE * FACE_FILL
-	var fp := Vector3(((i % n) + 0.5) / n - 0.5, 0.5 - ((i / n) + 0.5) / n, 0) * f + Vector3(0, 0, CUBE / 2)
+	var fp := _on_ball(Vector2(((i % n) + 0.5) / n - 0.5, 0.5 - ((i / n) + 0.5) / n) * f, 1.0)
 	return [a, _node_center(dst) + fp]
+
+
+## Same as on_ball() in edge.gdshaderinc.
+func _on_ball(p: Vector2, side: float) -> Vector3:
+	var r := BALL * 0.97
+	return Vector3(p.x, p.y, side * sqrt(maxf(r * r - p.length_squared(), 0.0)))
 
 
 ## Same as back_point() in edge.gdshaderinc.
 func _back_point(layer: int, dst: int) -> Vector3:
 	var i := dst - 784 if layer == 0 else (dst - 800 if layer == 1 else dst - 816)
 	var size := GRID_SIZE / 28.0 * FACE_FILL if layer == 0 else CUBE * FACE_FILL
-	var z := 0.0 if layer == 0 else -CUBE / 2
-	return Vector3((((i % 4) + 0.5) / 4.0 - 0.5) * size, (0.5 - ((i / 4) + 0.5) / 4.0) * size, z)
+	var p := Vector2((((i % 4) + 0.5) / 4.0 - 0.5) * size, (0.5 - ((i / 4) + 0.5) / 4.0) * size)
+	return Vector3(p.x, p.y, 0.0) if layer == 0 else _on_ball(p, -1.0)
 
 
 func edge_width(e: int) -> float:
 	var w := absf(edge_data[e * 2]) if edge_data.size() > e * 2 else 0.0
 	return maxf(MIN_WIDTH, (MAX_WIDTH_INPUT if e < 12544 else MAX_WIDTH) * w)
+
+
+## Same slack as edge.gdshaderinc: keep the two in step.
+const SLACK := 0.025
+var sway_t := 0.0
+
+
+## Point at `s` (0..1) along edge `e`, following its current curve, in local space.
+func edge_point(e: int, s: float) -> Vector3:
+	var ends := edge_ends(e)
+	var a: Vector3 = ends[0]
+	var dir: Vector3 = ends[1] - a
+	var fwd := dir.normalized()
+	var up := Vector3.RIGHT if absf(fwd.y) > 0.95 else Vector3.UP
+	var side := fwd.cross(up).normalized()
+	var up2 := side.cross(fwd)
+	var ph := fposmod(e * 0.618034, 1.0) * TAU
+	var bend := SLACK * dir.length() * (Vector3(0, -0.6, 0)
+		+ side * sin(sway_t * 0.35 + ph) * 0.8 + up2 * cos(sway_t * 0.27 + ph * 1.3) * 0.8)
+	return a + dir * s + bend * sin(PI * s)
 
 
 ## The line a ray points at: {edge, t (along the ray), s (0..1 along the line)}, or {}.
@@ -574,9 +616,26 @@ func pick_edge(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 		if t <= 0.0 or t >= best_t:
 			continue
 		var gap := (o + d * t).distance_to(a + u * s)
-		if gap < edge_width(e) / 2 + t * 0.004:
-			best_t = t
-			best = {"edge": e, "t": t, "s": s}
+		var reach := edge_width(e) / 2 + t * 0.004
+		if gap > reach + SLACK * sqrt(uu) * 1.3:
+			continue
+		# Close to the straight line: check the real curve, in 16 pieces.
+		var prev := edge_point(e, 0.0)
+		for k in range(1, 17):
+			var sk := k / 16.0
+			var cur := edge_point(e, sk)
+			var su := cur - prev
+			var sw := o - prev
+			var suu := su.dot(su)
+			var sud := su.dot(d)
+			var sden := suu - sud * sud
+			if sden > 1e-9:
+				var ss := clampf((su.dot(sw) - sud * d.dot(sw)) / sden, 0.0, 1.0)
+				var st := (prev + su * ss - o).dot(d)
+				if st > 0.0 and st < best_t and (o + d * st).distance_to(prev + su * ss) < reach:
+					best_t = st
+					best = {"edge": e, "t": st, "s": (k - 1 + ss) / 16.0}
+			prev = cur
 	return best
 
 

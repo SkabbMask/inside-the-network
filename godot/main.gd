@@ -64,6 +64,7 @@ var _in_flight_since := 0.0
 var _jump_on_meta := false
 var _pulse_on_meta := true
 var _drawn := false
+var _edited := 0   # weights the visitor changed at the snapshot shown
 var _console: Node3D       # parent of the board, buttons and timeline
 var _station: Transform3D  # where the visitor stands at the console, facing the network
 var _spark: MeshInstance3D
@@ -183,24 +184,40 @@ func _box(size: Vector3, pos: Vector3, color: Color) -> MeshInstance3D:
 
 func _build_world() -> void:
 	var env := Environment.new()
-	env.background_mode = Environment.BG_COLOR
-	env.background_color = Color(0.03, 0.035, 0.05)
+	# Deep space with stars (sky.gdshader).
+	var sky_mat := ShaderMaterial.new()
+	sky_mat.shader = load("res://sky.gdshader")
+	var sky := Sky.new()
+	sky.sky_material = sky_mat
+	env.background_mode = Environment.BG_SKY
+	env.sky = sky
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
-	env.ambient_light_color = Color(0.4, 0.42, 0.5)
-	# Fog fades far lines towards the background, so near ones stand out.
+	env.ambient_light_color = Color(0.14, 0.1, 0.22)
+	# Fog fades far lines towards the dark, so near ones stand out. The stars stay clear.
 	env.fog_enabled = true
-	env.fog_light_color = Color(0.03, 0.035, 0.05)
-	env.fog_density = 0.0025
+	env.fog_light_color = Color(0.025, 0.012, 0.045)
+	env.fog_density = 0.0022
+	env.fog_sky_affect = 0.0
+	# A light bloom: only the brightest pixels (the tubes' own glow, the pulse) bleed a
+	# little. It works on the finished image, so overlapping tubes never add up.
+	env.tonemap_mode = Environment.TONE_MAPPER_LINEAR   # keeps the neon colours saturated
+	# Screen-space reflections, so the glass balls mirror the neon tubes around them.
+	env.ssr_enabled = true
+	env.ssr_max_steps = 48
 	env.glow_enabled = true
-	env.glow_intensity = 0.6
-	env.glow_bloom = 0.05
+	env.glow_intensity = 0.5
+	env.glow_strength = 0.9
+	env.glow_bloom = 0.0
+	env.glow_hdr_threshold = 0.9
+	env.glow_blend_mode = Environment.GLOW_BLEND_MODE_SCREEN
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
 	# One light from above and to the side, to shade the round lines.
 	var sun := DirectionalLight3D.new()
 	sun.rotation = Vector3(deg_to_rad(-50), deg_to_rad(35), 0)
-	sun.light_energy = 1.1
+	sun.light_energy = 0.7
+	sun.light_color = Color(0.85, 0.8, 1.0)
 	add_child(sun)
 	_floor = MeshInstance3D.new()
 	var plane := PlaneMesh.new()
@@ -208,6 +225,7 @@ func _build_world() -> void:
 	_floor.mesh = plane
 	_floor.material_override = _flat(Color(0.055, 0.06, 0.075))
 	_floor.position.y = -0.002
+	_floor.visible = false   # floating in space; kept for the console's sake if wanted
 	add_child(_floor)
 
 
@@ -224,6 +242,7 @@ func _build_buttons() -> void:
 		["train", "Train from scratch"],
 		["reset", "Standard run"],
 		["center", "Help: centre it"],
+		["undo", "Undo my changes"],
 	]
 	var y := 1.47
 	for d in defs:
@@ -271,6 +290,9 @@ func _press_button(id: String) -> void:
 			client.send({"type": "retrain"})
 		"reset":
 			client.send({"type": "reset"})
+		"undo":
+			client.send({"type": "clear_edits"})
+			_pulse_on_meta = true
 		"center":
 			client.send({"type": "center", "on": not center})
 			_pulse_on_meta = true
@@ -376,6 +398,9 @@ func _unhandled_input(event: InputEvent) -> void:
 			_mouse_left = event.pressed
 		elif event.button_index == MOUSE_BUTTON_RIGHT:
 			_mouse_right = event.pressed
+		# While holding a line, the wheel makes its weight stronger or weaker.
+		elif event.pressed and not _grab.is_empty() and event.button_index in [MOUSE_BUTTON_WHEEL_UP, MOUSE_BUTTON_WHEEL_DOWN]:
+			_nudge_grabbed(1 if event.button_index == MOUSE_BUTTON_WHEEL_UP else -1)
 	elif event is InputEventMouseMotion and Input.is_mouse_button_pressed(MOUSE_BUTTON_MIDDLE):
 		_yaw -= event.relative.x * 0.004
 		_pitch = clampf(_pitch - event.relative.y * 0.004, -1.3, 1.3)
@@ -491,8 +516,9 @@ func _update_pointer(p: Dictionary) -> void:
 	var kind: String = h.get("kind", "")
 	var trig_down: bool = trig and not p.trigger
 	# Clicking a line (nearer than anything else under the pointer) grabs it; letting go
-	# releases it.
-	if trig_down and not p.ctrl and kind != "button":
+	# releases it. On the drawing surface or a button, the click is always for that: the
+	# pixel lines start right on the screen, so they would otherwise win.
+	if trig_down and not p.ctrl and kind != "button" and kind != "pad":
 		var g: Dictionary = view.pick_edge(origin, dir)
 		if not g.is_empty() and (kind == "" or g.t < h.t):
 			_start_grab(g.edge, g.s)
@@ -579,7 +605,7 @@ func _start_grab(e: int, s: float) -> void:
 	var ends: Array = view.edge_ends(e)
 	var a: Vector3 = view.to_global(ends[0])
 	var b: Vector3 = view.to_global(ends[1])
-	var p := a.lerp(b, s)
+	var p: Vector3 = view.to_global(view.edge_point(e, s))
 	var away := _cam.global_position - p
 	# Hang beside the line, on the side you came from.
 	away -= (b - a).normalized() * away.dot((b - a).normalized())
@@ -588,6 +614,15 @@ func _start_grab(e: int, s: float) -> void:
 	var offset: Vector3 = away.normalized() * (view.edge_width(e) / 2 + GRAB_REACH)
 	_grab = {"edge": e, "a": a, "b": b, "s": s, "offset": offset}
 	view.set_grabbed(e)
+
+
+## Change the held line's weight by `steps` (each 5% of its layer's largest weight).
+## Positive makes it more positive: a blue (negative) line shrinks, then turns pink.
+func _nudge_grabbed(steps: int) -> void:
+	if not client.is_open or recording:
+		return
+	client.send({"type": "nudge_weight", "edge": _grab.edge, "steps": steps})
+	_pulse_on_meta = _drawn
 
 
 func _end_grab() -> void:
@@ -607,9 +642,10 @@ func _move_along_grab(delta: float) -> void:
 	var look := -_cam.global_basis.z
 	var toward_b := 1.0 if (b - a).dot(look) >= 0.0 else -1.0
 	var speed := FLY_SPEED * (4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0)
-	var margin := (NetworkView.CUBE * 0.5 + 2.0) / length
+	var margin := (NetworkView.BALL + 2.0) / length
 	_grab.s = clampf(_grab.s + pull * toward_b * speed * delta / length, 0.0 if _grab.edge < 12544 else margin, 1.0 - margin)
-	var target: Vector3 = a.lerp(b, _grab.s) + _grab.offset
+	# Follow the line as it sways.
+	var target: Vector3 = view.to_global(view.edge_point(_grab.edge, _grab.s)) + _grab.offset
 	_cam.global_position = _cam.global_position.lerp(target, 1.0 - exp(-delta * 6.0))
 
 
@@ -658,6 +694,7 @@ func _on_json(msg: Dictionary) -> void:
 			view.apply_meta(msg)
 			_drawn = msg.get("drawn", false)
 			center = msg.get("center", false)
+			_edited = int(msg.get("edited", 0))
 			view.set_center(center)
 			_button("center").label.text = "Stop helping" if center else "Help: centre it"
 			if _pulse_on_meta:
@@ -680,6 +717,8 @@ func _update_status() -> void:
 		_status.text = "Recording a new training run from random weights…"
 		return
 	_status.text = "Draw a digit on the board"
+	if _edited > 0:
+		_status.text = "You changed %d weight%s at this step" % [_edited, "" if _edited == 1 else "s"]
 	_button("play").label.text = "Pause" if playing else "Play"
 	if steps.is_empty() or shown_index < 0:
 		return
@@ -739,6 +778,13 @@ func _run_screenshot_demo() -> void:
 		view._recolor()
 		for i in 5:
 			await get_tree().process_frame
+	# Report how long frames take here, with vsync off, before saving.
+	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
+	var f0 := Engine.get_frames_drawn()
+	var t1 := Time.get_ticks_usec()
+	for i in 120:
+		await get_tree().process_frame
+	print("Frame time: %.2f ms" % ((Time.get_ticks_usec() - t1) / 1000.0 / maxi(Engine.get_frames_drawn() - f0, 1)))
 	await RenderingServer.frame_post_draw
 	get_viewport().get_texture().get_image().save_png(screenshot_path)
 	print("Screenshot saved: ", screenshot_path, " at snapshot ", shown_index, " answer ", view._answer.text)

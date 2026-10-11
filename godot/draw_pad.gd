@@ -25,7 +25,7 @@ func build() -> void:
 	frame.mesh = fq
 	var fm := StandardMaterial3D.new()
 	fm.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	fm.albedo_color = Color(0.32, 0.36, 0.42)
+	fm.albedo_color = Color(0.2, 1.0, 0.4)   # terminal green, like the console
 	frame.material_override = fm
 	frame.position.z = -0.003
 	add_child(frame)

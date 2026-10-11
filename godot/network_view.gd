@@ -50,7 +50,9 @@ const COL_NEG := Color(0.12, 0.55, 1.0)    # electric blue: pushes it off
 const COL_IDLE := Color(0.09, 0.04, 0.15)
 const COL_LIT := Color(1.0, 0.86, 1.0)
 const COL_OFF := Color(0.55, 0.08, 0.12)
-const COL_TEXT := Color(0.82, 0.72, 1.0)
+const COL_TEXT := Color(1.0, 0.28, 0.75)       # bright pink, in the console's retro font
+const COL_TEXT_DIM := Color(0.85, 0.22, 0.62)
+const NETWORK_FONT_SCALE := 1.6                 # VT323 is small for its size; and a bit larger
 const COL_FRAME := Color(0.62, 0.22, 1.0)  # the input screen's neon border
 
 var input_pos := PackedVector3Array()
@@ -68,9 +70,9 @@ var acts := PackedFloat32Array()
 var off := [[], [], [], []]
 var selected := Vector2i(-1, -1)
 
-var edge_mat: ShaderMaterial
+var edge_mat: ShaderMaterial   # the first batch's material (for reading settings)
+var _edge_mats := []           # every batch's solid and faded materials
 var edge_data := PackedFloat32Array()
-var _edge_faded_mat: ShaderMaterial
 var _edge_tex := []   # two ImageTextures, alternating
 var _pos_tex := []
 var _cur := 0         # which of the two holds the newest data
@@ -131,6 +133,11 @@ func _fixed_positions() -> PackedVector3Array:
 	return out
 
 
+## The console's retro terminal font (see main.gd), for the panel that travels with it.
+func _mono() -> Font:
+	return load("res://assets/fonts/VT323-Regular.ttf")
+
+
 func _unshaded(color: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
@@ -141,8 +148,9 @@ func _unshaded(color: Color) -> StandardMaterial3D:
 func _label(text: String, pos: Vector3, size := 40, color := COL_TEXT, billboard := false) -> Label3D:
 	var l := Label3D.new()
 	l.text = text
-	l.font_size = size
+	l.font_size = int(size * NETWORK_FONT_SCALE)
 	l.pixel_size = LABEL_PIXEL
+	l.font = _mono()
 	l.outline_size = 0
 	l.modulate = color
 	l.position = pos
@@ -180,64 +188,79 @@ func _build_input() -> void:
 
 
 func _build_edges() -> void:
-	# Each connection is a round tube: a unit cylinder the shader stretches between neurons.
+	for k in 2:
+		_edge_tex.append(ImageTexture.create_from_image(Image.create(EDGE_TEX_W, EDGE_TEX_H, false, Image.FORMAT_RGF)))
+		_pos_tex.append(ImageTexture.create_from_image(_pos_img))
+	# Two batches with the same shader: the 12,544 thin pixel lines need far less detail
+	# than the 416 thick cables, and they are most of the GPU's work.
+	_add_edge_batch(0, 12544, 6, 0)   # straight: no segments along
+	_add_edge_batch(12544, 416, 16, 11)
+	edge_mat = _edge_mats[0]
+	set_edge_param("tex_w", EDGE_TEX_W)
+	set_edge_param("cube", CUBE)
+	set_edge_param("ball", BALL)
+	set_edge_param("pixel", GRID_SIZE / 28.0)
+	set_edge_param("max_width", MAX_WIDTH)
+	set_edge_param("max_width_input", MAX_WIDTH_INPUT)
+	set_edge_param("min_width", MIN_WIDTH)
+	set_edge_param("face_fill", FACE_FILL)
+	set_edge_param("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
+	set_edge_param("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
+	set_edge_param("glow_input", 0.35)
+	set_edge_param("glow_cable", 0.6)
+	_bind_textures()
+
+
+## One MultiMesh of round tubes for edges first .. first + count - 1 (the scene's edge
+## order), with `sides` around and `rings` + 1 segments along, so they can curve.
+func _add_edge_batch(first: int, count: int, sides: int, rings: int) -> void:
 	var mesh := CylinderMesh.new()
 	mesh.top_radius = 0.5
 	mesh.bottom_radius = 0.5
 	mesh.height = 1.0
-	mesh.radial_segments = 16
-	mesh.rings = 11   # 12 segments along each line, so it can curve
+	mesh.radial_segments = sides
+	mesh.rings = rings
 	mesh.cap_top = false
 	mesh.cap_bottom = false
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_custom_data = true
 	mm.mesh = mesh
-	mm.instance_count = 784 * 16 + 16 * 16 + 16 * 10
+	mm.instance_count = count
 	var idx := 0
+	var e := 0
 	for l in range(1, 4):
 		for j in SIZES[l]:
 			for i in SIZES[l - 1]:
-				mm.set_instance_transform(idx, Transform3D.IDENTITY)
-				mm.set_instance_custom_data(idx, Color(NODE_OFFSET[l - 1] + i, NODE_OFFSET[l] + j, l - 1, 0))
-				idx += 1
+				if e >= first and e < first + count:
+					mm.set_instance_transform(idx, Transform3D.IDENTITY)
+					mm.set_instance_custom_data(idx, Color(NODE_OFFSET[l - 1] + i, NODE_OFFSET[l] + j, l - 1, 0))
+					idx += 1
+				e += 1
 	var inst := MultiMeshInstance3D.new()
 	inst.multimesh = mm
 	inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	# The shader moves every vertex, so tell the engine where the edges can be.
 	inst.custom_aabb = AABB(Vector3(-ANSWER_WIDTH / 2 - CUBE, -1, LAYER_Z[3] - CUBE),
 		Vector3(ANSWER_WIDTH + 2 * CUBE, GRID_Y + GRID_SIZE / 2 + CUBE + 1, -LAYER_Z[3] + 2 * CUBE))
-	edge_mat = ShaderMaterial.new()
-	edge_mat.shader = load("res://edge.gdshader")
+	var mat := ShaderMaterial.new()
+	mat.shader = load("res://edge.gdshader")
 	# A second pass draws the lines not touching a selected neuron, see-through.
-	_edge_faded_mat = ShaderMaterial.new()
-	_edge_faded_mat.shader = load("res://edge_faded.gdshader")
-	edge_mat.next_pass = _edge_faded_mat
-	for k in 2:
-		_edge_tex.append(ImageTexture.create_from_image(Image.create(EDGE_TEX_W, EDGE_TEX_H, false, Image.FORMAT_RGF)))
-		_pos_tex.append(ImageTexture.create_from_image(_pos_img))
-	set_edge_param("tex_w", EDGE_TEX_W)
-	set_edge_param("cube", CUBE)
-	set_edge_param("ball", BALL)
-	set_edge_param("pixel", GRID_SIZE / 28.0)
-	set_edge_param("max_width", MAX_WIDTH)
-	set_edge_param("face_fill", FACE_FILL)
-	set_edge_param("max_width_input", MAX_WIDTH_INPUT)
-	set_edge_param("min_width", MIN_WIDTH)
-	set_edge_param("face_fill", FACE_FILL)
-	set_edge_param("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
-	set_edge_param("glow_input", 0.35)
-	set_edge_param("glow_cable", 0.6)
-	set_edge_param("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
-	_bind_textures()
-	inst.material_override = edge_mat
+	var faded := ShaderMaterial.new()
+	faded.shader = load("res://edge_faded.gdshader")
+	mat.next_pass = faded
+	mat.set_shader_parameter("id_offset", first)
+	faded.set_shader_parameter("id_offset", first)
+	_edge_mats.append(mat)
+	_edge_mats.append(faded)
+	inst.material_override = mat
 	add_child(inst)
 
 
-## Edge settings go to both passes.
+## Edge settings go to every batch and pass.
 func set_edge_param(name: String, value) -> void:
-	edge_mat.set_shader_parameter(name, value)
-	_edge_faded_mat.set_shader_parameter(name, value)
+	for m in _edge_mats:
+		m.set_shader_parameter(name, value)
 
 
 func _bind_textures() -> void:
@@ -260,16 +283,19 @@ func _build_nodes() -> void:
 	var sh := Shader.new()
 	sh.code = """
 shader_type spatial;
-uniform vec3 col = vec3(0.0);   // the inner light: activation (or red when switched off)
+uniform vec3 col = vec3(0.0);   // the inner light: activation
+uniform float off = 0.0;        // 1 = switched off by the visitor: glows red, rim and all
 void fragment() {
 	float facing = clamp(dot(NORMAL, VIEW), 0.0, 1.0);
+	float rim = pow(1.0 - facing, 2.0);
 	ALBEDO = vec3(0.005, 0.003, 0.01);
 	METALLIC = 0.0;
 	ROUGHNESS = 0.03;
 	SPECULAR = 1.0;
 	CLEARCOAT = 1.0;
 	CLEARCOAT_ROUGHNESS = 0.02;
-	EMISSION = col * pow(facing, 4.0) * 1.3;
+	EMISSION = col * pow(facing, 4.0) * 1.3
+		+ vec3(1.0, 0.06, 0.12) * off * (0.5 + 2.5 * rim);
 }
 """
 	for k in 42:
@@ -285,10 +311,11 @@ void fragment() {
 	for d in 10:
 		var l := Label3D.new()
 		l.text = str(d)
-		l.font_size = 64
+		l.font = _mono()
+		l.font_size = int(64 * NETWORK_FONT_SCALE)
 		l.pixel_size = LABEL_PIXEL * 0.6
 		l.outline_size = 0
-		l.modulate = Color(0.55, 0.45, 0.78)
+		l.modulate = COL_TEXT_DIM
 		l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
 		l.position = Vector3(0, BALL + CUBE * 0.4, 0)
 		node_inst[32 + d].add_child(l)
@@ -302,10 +329,11 @@ func _build_labels() -> void:
 	for l in 4:
 		var y := top + 3.0 * CUBE if l < 3 else GRID_Y + 3.0 * CUBE
 		_label(names[l], Vector3(0, y, LAYER_Z[l]), 44, COL_TEXT, true)
-	_label("Each neuron keeps its place, so you can follow it. Its place in the grid means nothing: every neuron is connected to every pixel.
+	_label("Each neuron keeps its place, so you can follow it.
+Its place in the grid means nothing: every neuron is connected to every pixel.
 Line thickness compares weights within one layer, not between layers.",
-		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, Color(0.62, 0.5, 0.85), true)
-	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, Color(0.62, 0.5, 0.85), true)
+		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, COL_TEXT_DIM, true)
+	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, COL_TEXT_DIM, true)
 	set_center(false)
 	_answer = _label("", Vector3(0, GRID_Y + 0.5 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 200, COL_LIT, true)
 	_answer_caption = _label("", Vector3(0, GRID_Y - 0.4 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 40, COL_TEXT, true)
@@ -328,16 +356,19 @@ func _build_panel() -> void:
 	_panel_quad.material_override = m
 	_panel.add_child(_panel_quad)
 	_panel_title = Label3D.new()
-	_panel_title.font_size = 36
+	_panel_title.font_size = 48
 	_panel_title.pixel_size = 0.0015
 	_panel_title.outline_size = 0
 	_panel_title.position = Vector3(0, 0.27, 0)
+	_panel_title.modulate = Color(0.25, 1.0, 0.45)
+	_panel_title.font = _mono()
 	_panel.add_child(_panel_title)
 	_panel_caption = Label3D.new()
-	_panel_caption.font_size = 28
+	_panel_caption.font_size = 38
 	_panel_caption.pixel_size = 0.0015
 	_panel_caption.outline_size = 0
-	_panel_caption.modulate = Color(0.7, 0.74, 0.8)
+	_panel_caption.modulate = Color(0.12, 0.6, 0.25)
+	_panel_caption.font = _mono()
 	_panel_caption.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_panel_caption.width = 300
 	_panel_caption.position = Vector3(0, -0.32, 0)
@@ -409,7 +440,7 @@ func set_center(on: bool) -> void:
 ## The selected-neuron panel stands to the left of the console. `station` is where the
 ## visitor stands at the console, facing the network.
 func place_panel(station: Transform3D) -> void:
-	var local := Transform3D(Basis(), Vector3(-1.75, 1.35, -0.75)).looking_at(Vector3(0, 1.4, 0.6), Vector3.UP, true)
+	var local := Transform3D(Basis(), Vector3(-2.2, 1.3, -0.55)).looking_at(Vector3(0, 1.4, 0.6), Vector3.UP, true)
 	_panel.global_transform = station * local
 
 
@@ -485,12 +516,13 @@ func apply_nodes(payload: PackedByteArray) -> void:
 
 func apply_meta(meta: Dictionary) -> void:
 	var o: Array = meta.get("off", [[], []])
-	off[1] = o[0] if o.size() > 0 else []
-	off[2] = o[1] if o.size() > 1 else []
+	# JSON numbers arrive as floats; neuron indices are compared as ints.
+	off[1] = (o[0] if o.size() > 0 else []).map(func(v): return int(v))
+	off[2] = (o[1] if o.size() > 1 else []).map(func(v): return int(v))
 	var pred = meta.get("prediction")
 	for i in 10:
 		var lit: bool = pred != null and int(pred) == i
-		_digit_labels[i].modulate = COL_LIT if lit else Color(0.55, 0.45, 0.78)
+		_digit_labels[i].modulate = COL_LIT if lit else COL_TEXT_DIM
 	if pred == null:
 		_answer.text = ""
 		_answer_caption.text = ""
@@ -513,11 +545,13 @@ func _recolor() -> void:
 		var ln := _layer_of(k)
 		var m: ShaderMaterial = node_mats[k]
 		if off[ln.x].has(ln.y):
-			m.set_shader_parameter("col", COL_OFF * 0.5)
+			m.set_shader_parameter("col", Vector3.ZERO)
+			m.set_shader_parameter("off", 1.0)
 		else:
 			# A neuron lights up when the pulse reaches its layer.
 			var arrived := smoothstep(float(ln.x) - 0.2, float(ln.x), pulse_t)
 			m.set_shader_parameter("col", COL_LIT * clampf(acts[784 + k], 0.0, 1.0) * arrived)
+			m.set_shader_parameter("off", 0.0)
 		node_inst[k].scale = Vector3.ONE * (1.2 if selected == ln else 1.0)
 
 
@@ -577,6 +611,8 @@ func edge_width(e: int) -> float:
 ## Same slack as edge.gdshaderinc: keep the two in step.
 const SLACK := 0.025
 var sway_t := 0.0
+var _grab_edge := -1          # the held line: frozen, so holding it never moves you
+var _grab_sway_t := 0.0
 
 
 ## Point at `s` (0..1) along edge `e`, following its current curve, in local space.
@@ -589,8 +625,11 @@ func edge_point(e: int, s: float) -> Vector3:
 	var side := fwd.cross(up).normalized()
 	var up2 := side.cross(fwd)
 	var ph := fposmod(e * 0.618034, 1.0) * TAU
+	if e < 12544:   # pixel lines are straight; cables sag and sway
+		return a + dir * s
+	var st := _grab_sway_t if e == _grab_edge else sway_t
 	var bend := SLACK * dir.length() * (Vector3(0, -0.6, 0)
-		+ side * sin(sway_t * 0.35 + ph) * 0.8 + up2 * cos(sway_t * 0.27 + ph * 1.3) * 0.8)
+		+ side * sin(st * 0.35 + ph) * 0.8 + up2 * cos(st * 0.27 + ph * 1.3) * 0.8)
 	return a + dir * s + bend * sin(PI * s)
 
 
@@ -639,9 +678,64 @@ func pick_edge(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 	return best
 
 
-## Light up the grabbed line (or none with -1).
+## The cable whose surface is nearest a point, if within `reach` metres of it:
+## {edge, s (0..1 along it), gap (metres from the point to its surface)}, or {}.
+func nearest_edge(world_point: Vector3, reach: float) -> Dictionary:
+	var p := to_local(world_point)
+	var best := {}
+	var best_gap := reach
+	for e in N_EDGES:
+		var ends := edge_ends(e)
+		var a: Vector3 = ends[0]
+		var u: Vector3 = ends[1] - a
+		var uu := u.dot(u)
+		if uu < 1e-9:
+			continue
+		var r := edge_width(e) / 2.0
+		# Straight line first; curved cables can stray from it by their slack.
+		var s := clampf((p - a).dot(u) / uu, 0.0, 1.0)
+		var slack := 0.0 if e < 12544 else SLACK * sqrt(uu) * 1.3
+		if p.distance_to(a + u * s) - r - slack > best_gap:
+			continue
+		if e >= 12544:
+			# Refine on the real curve, in 32 steps, then one finer pass.
+			var best_s := s
+			var best_d := INF
+			for k in 33:
+				var sk := k / 32.0
+				var d := p.distance_to(edge_point(e, sk))
+				if d < best_d:
+					best_d = d
+					best_s = sk
+			# Project exactly onto the curve pieces either side of the best sample.
+			var s_best := best_s
+			for side in [-1.0, 1.0]:
+				var s1 := clampf(best_s + side / 32.0, 0.0, 1.0)
+				var q0 := edge_point(e, best_s)
+				var q1 := edge_point(e, s1)
+				var seg := q1 - q0
+				var ll := seg.dot(seg)
+				if ll < 1e-9:
+					continue
+				var f := clampf((p - q0).dot(seg) / ll, 0.0, 1.0)
+				var d := p.distance_to(q0 + seg * f)
+				if d < best_d:
+					best_d = d
+					s_best = lerpf(best_s, s1, f)
+			s = s_best
+		var gap := p.distance_to(edge_point(e, s)) - r
+		if gap < best_gap:
+			best_gap = gap
+			best = {"edge": e, "s": s, "gap": maxf(gap, 0.0)}
+	return best
+
+
+## Light up the held line (or none with -1) and freeze its sway where it is now.
 func set_grabbed(e: int) -> void:
+	_grab_edge = e
+	_grab_sway_t = sway_t
 	set_edge_param("grab_edge", float(e))
+	set_edge_param("grab_sway_t", _grab_sway_t)
 
 
 # ------------------------------------------------------------------ picking and selection

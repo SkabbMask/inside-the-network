@@ -20,11 +20,40 @@ const BAR_X1 := -0.38
 const BAR_Y := 0.9
 const SPARK_H := 0.1
 const CONSOLE_DISTANCE := 1.6   # from the middle of the network, sideways, in grid widths
-const FLY_SPEED := 40.0         # metres per second; hold Shift for 4x
+const VR_RENDER_SCALE := 0.75   # share of SteamVR's recommended resolution, per axis
+const FLY_SPEED := 40.0          # metres per second; hold Shift (or click the stick) for 4x
+# VR movement, tuned for comfort: no head-steered motion, snap turns, a vignette.
+const SNAP_ANGLE := 30.0          # degrees per snap turn
+const VR_PULL_GAIN := 25.0        # hand movement along a held cable is amplified this much
+const VR_EDIT_INTERVAL := 0.12    # seconds between weight notches while a stick is held
+const STICK_DEADZONE := 0.15
+const HAND_SCALE := 1.5           # the hand models are drawn this much larger than life
+const VR_GRAB_RANGE := 6.0        # metres: the grip catches a cable this close to the hand
+# The grip only switches off a neuron no further away than the gap between two neighbouring
+# neurons in a grid, measured to the ball's surface.
+const VR_TOGGLE_RANGE := NetworkView.GRID_SIZE / 3.0
 
-const COL_BTN := Color(0.17, 0.19, 0.24)
-const COL_BTN_HOVER := Color(0.3, 0.33, 0.4)
-const COL_TEXT := Color(0.85, 0.88, 0.92)
+# The console's housing: Kenney's "computer-wide" (Space Station Kit, CC0). Its screen face
+# (measured from the mesh) is centred at SCREEN_CENTER, faces SCREEN_NORMAL and is 0.8 m wide;
+# it is scaled up and turned so the screen sits just behind the console's buttons and pad.
+const CONSOLE_MODEL := "res://assets/kenney/computer-wide.glb"
+const SCREEN_CENTER := Vector3(0.0, 0.365, 0.006)
+const SCREEN_NORMAL := Vector3(0.0, 0.83, 0.55)
+const CONSOLE_SCALE := 2.15
+const PANEL_CENTER := Vector2(-0.84, 1.17)   # middle of the buttons, pad and timeline
+# Where your head ends up relative to the console when you summon it (console space).
+const SUMMON_HEAD := Vector3(-0.84, 1.5, 0.6)
+
+# The console is a green-on-black terminal.
+const COL_BTN := Color(0.01, 0.05, 0.02)
+const COL_BTN_HOVER := Color(0.05, 0.32, 0.1)
+const COL_TEXT := Color(0.25, 1.0, 0.45)
+const COL_TEXT_DIM := Color(0.12, 0.6, 0.25)
+const COL_GREEN := Color(0.2, 1.0, 0.4)   # frames, curve, the housing's rim
+# VT323 (SIL Open Font License), bundled so it looks the same on every machine. Its
+# letters are small for their size, so console text is drawn this much larger.
+const TERMINAL_FONT := "res://assets/fonts/VT323-Regular.ttf"
+const TERMINAL_FONT_SCALE := 1.2
 
 var server_url := "ws://127.0.0.1:8765"
 var screenshot_path := ""
@@ -36,6 +65,9 @@ var screenshot_cam = null    # Vector3 in network coordinates, or null for a pre
 var screenshot_look = null
 var screenshot_select := Vector2i(-1, -1)
 var screenshot_grab := false
+var screenshot_hands := false
+var screenshot_summon := false
+var screenshot_off := Vector2i(-1, -1)
 
 var client
 var view
@@ -69,6 +101,24 @@ var _console: Node3D       # parent of the board, buttons and timeline
 var _station: Transform3D  # where the visitor stands at the console, facing the network
 var _spark: MeshInstance3D
 var _floor: MeshInstance3D
+var _env: Environment
+var _perf_t := 0.0
+# VR
+var _origin: XROrigin3D
+var _xr_cam: XRCamera3D
+var _hands := []            # [left, right] XRController3D
+var _hand_models := []      # [left, right] XRToolsHand
+var _palms := []            # [left, right] where each palm is (the hands' aim-offset nodes)
+var _hand_rest: Node3D      # where the holding hand is drawn: on the cable's surface
+var _vel := Vector3.ZERO    # current flying velocity, metres per second
+var _snap_ready := true
+var _snap_flash := 0.0      # vignette flash after a snap turn, fades out
+var _edit_t := 0.0
+var _vignette: ShaderMaterial
+var _console_to := Transform3D()   # where the console is flying to after a summon
+var _console_moving := false
+var _summon_was_down := false
+var _perf_flags := PackedStringArray()   # test switches: nomsaa, noglow, nofog, nossr
 var _playhead_mark: MeshInstance3D
 
 # desktop camera
@@ -96,11 +146,20 @@ func _ready() -> void:
 			screenshot_cam = _vec3_arg(a.trim_prefix("--cam="))
 		elif a.begins_with("--look="):
 			screenshot_look = _vec3_arg(a.trim_prefix("--look="))
+		elif a.begins_with("--off="):
+			var q := a.trim_prefix("--off=").split(",")
+			screenshot_off = Vector2i(int(q[0]), int(q[1]))
+		elif a == "--summon":
+			screenshot_summon = true
+		elif a == "--hands":
+			screenshot_hands = true
 		elif a == "--grab":
 			screenshot_grab = true
 		elif a.begins_with("--select="):
 			var p := a.trim_prefix("--select=").split(",")
 			screenshot_select = Vector2i(int(p[0]), int(p[1]))
+		elif a.begins_with("--perf="):
+			_perf_flags = a.trim_prefix("--perf=").split(",")
 		elif a.begins_with("--center="):
 			screenshot_center = a.trim_prefix("--center=") == "1"
 
@@ -118,6 +177,7 @@ func _ready() -> void:
 	add_child(_console)
 	_console.transform = _station
 	view.place_panel(_station)
+	_build_console_housing()
 	_floor.position = (mid + spot) / 2 - Vector3(0, 0.002, 0)
 
 	pad = DrawPad.new()
@@ -131,7 +191,7 @@ func _ready() -> void:
 
 	_build_buttons()
 	_build_timeline()
-	_status = _make_label("", Vector3(-1.0, 1.55, PANEL_Z), 26)
+	_status = _make_label("", Vector3(-1.0, 1.535, PANEL_Z), 22)
 
 	client = NetClient.new()
 	add_child(client)
@@ -155,13 +215,93 @@ func _ready() -> void:
 func _make_label(text: String, pos: Vector3, size := 30, color := COL_TEXT) -> Label3D:
 	var l := Label3D.new()
 	l.text = text
-	l.font_size = size
+	l.font_size = int(size * TERMINAL_FONT_SCALE)
 	l.pixel_size = 0.0015
 	l.outline_size = 0
 	l.modulate = color
 	l.position = pos
+	l.font = _mono()
 	_console.add_child(l)
 	return l
+
+
+## The console's retro terminal font.
+func _mono() -> Font:
+	return load(TERMINAL_FONT)
+
+
+## Put the console's housing behind its buttons, pad and timeline, restyled to match the
+## console: dark glass with a terminal-green rim.
+func _build_console_housing() -> void:
+	var model: Node3D = load(CONSOLE_MODEL).instantiate()
+	var mat := ShaderMaterial.new()
+	mat.shader = Shader.new()
+	# Only the screen slab is kept: the stand and body (anything in front of the screen face
+	# or more than the slab's thickness behind it) are cut away, so it floats like a panel.
+	mat.shader.code = """
+shader_type spatial;
+render_mode cull_disabled;
+uniform vec3 screen_center;
+uniform vec3 screen_normal;
+uniform vec3 screen_up;
+varying float v_depth;
+varying float v_up;
+void vertex() {
+	v_depth = dot(VERTEX - screen_center, screen_normal);
+	v_up = dot(VERTEX - screen_center, screen_up);
+}
+void fragment() {
+	if (v_depth < -0.105 || v_depth > 0.0 || v_up < -0.235) {
+		discard;
+	}
+	float rim = pow(1.0 - clamp(abs(dot(NORMAL, VIEW)), 0.0, 1.0), 3.0);
+	ALBEDO = vec3(0.012, 0.008, 0.02);
+	ROUGHNESS = 0.15;
+	SPECULAR = 0.7;
+	EMISSION = vec3(0.2, 1.0, 0.4) * rim * 0.3;
+}
+"""
+	mat.set_shader_parameter("screen_center", SCREEN_CENTER)
+	mat.set_shader_parameter("screen_normal", SCREEN_NORMAL.normalized())
+	# Up along the screen face; the screen's bottom edge is 0.23 below its centre.
+	mat.set_shader_parameter("screen_up", Vector3(0, SCREEN_NORMAL.z, -SCREEN_NORMAL.y).normalized())
+	for mi in model.find_children("*", "MeshInstance3D", true, false):
+		(mi as MeshInstance3D).material_override = mat
+	# Turn the screen to face the visitor (+z in console space), scale it, and move its
+	# centre to just behind the middle of the panel.
+	var turn := Basis(Quaternion(SCREEN_NORMAL.normalized(), Vector3.BACK))
+	var basis := turn.scaled(Vector3.ONE * CONSOLE_SCALE)
+	var centre := Vector3(PANEL_CENTER.x, PANEL_CENTER.y, PANEL_Z - 0.02)
+	model.transform = Transform3D(basis, centre - basis * SCREEN_CENTER)
+	_console.add_child(model)
+
+
+## Bring the console to just in front of you, facing you (left controller B, desktop C).
+func _summon_console() -> void:
+	var head := _head_pos()
+	var look := -(_xr_cam.global_basis.z if vr else _cam.global_basis.z)
+	look.y = 0.0
+	if look.length() < 1e-3:
+		look = Vector3.FORWARD
+	var basis := Basis.looking_at(look.normalized(), Vector3.UP)
+	_console_to = Transform3D(basis, head - basis * SUMMON_HEAD)
+	_console_moving = true
+
+
+## The console glides to where it was summoned.
+func _move_console(delta: float) -> void:
+	if not _console_moving:
+		return
+	var t := 1.0 - exp(-delta * 8.0)
+	var now := _console.global_transform
+	now.origin = now.origin.lerp(_console_to.origin, t)
+	now.basis = Basis(now.basis.get_rotation_quaternion().slerp(_console_to.basis.get_rotation_quaternion(), t))
+	_console.global_transform = now
+	view.place_panel(now)
+	if now.origin.distance_to(_console_to.origin) < 0.01:
+		_console.global_transform = _console_to
+		view.place_panel(_console_to)
+		_console_moving = false
 
 
 func _flat(color: Color) -> StandardMaterial3D:
@@ -184,6 +324,7 @@ func _box(size: Vector3, pos: Vector3, color: Color) -> MeshInstance3D:
 
 func _build_world() -> void:
 	var env := Environment.new()
+	_env = env
 	# Deep space with stars (sky.gdshader).
 	var sky_mat := ShaderMaterial.new()
 	sky_mat.shader = load("res://sky.gdshader")
@@ -230,6 +371,8 @@ func _build_world() -> void:
 
 
 func _add_button(id: String, text: String, center: Vector2, size: Vector2) -> void:
+	# A thin green frame behind a dark face.
+	_box(Vector3(size.x + 0.006, size.y + 0.006, 0.018), Vector3(center.x, center.y, PANEL_Z - 0.012), COL_GREEN)
 	var mi := _box(Vector3(size.x, size.y, 0.02), Vector3(center.x, center.y, PANEL_Z - 0.01), COL_BTN)
 	var l := _make_label(text, Vector3(center.x, center.y, PANEL_Z + 0.002), 22)
 	_buttons.append({"id": id, "rect": Rect2(center - size / 2, size), "label": l, "mat": mi.material_override})
@@ -244,21 +387,22 @@ func _build_buttons() -> void:
 		["center", "Help: centre it"],
 		["undo", "Undo my changes"],
 	]
-	var y := 1.47
-	for d in defs:
-		_add_button(d[0], d[1], Vector2(-0.53, y), Vector2(0.27, 0.07))
-		y -= 0.09
+	# Two columns of three, so they end above the timeline.
+	for i in defs.size():
+		var x := -0.625 if i < 3 else -0.325
+		var y := 1.47 - (i % 3) * 0.09
+		_add_button(defs[i][0], defs[i][1], Vector2(x, y), Vector2(0.29, 0.07))
 
 
 func _build_timeline() -> void:
 	var w := BAR_X1 - BAR_X0
-	_box(Vector3(w, 0.012, 0.01), Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y, PANEL_Z - 0.01), Color(0.25, 0.28, 0.34))
-	_playhead_mark = _box(Vector3(0.006, SPARK_H + 0.04, 0.012), Vector3(BAR_X0, BAR_Y + SPARK_H / 2, PANEL_Z), Color(1.0, 0.85, 0.5))
+	_box(Vector3(w, 0.012, 0.01), Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y, PANEL_Z - 0.01), COL_TEXT_DIM)
+	_playhead_mark = _box(Vector3(0.006, SPARK_H + 0.04, 0.012), Vector3(BAR_X0, BAR_Y + SPARK_H / 2, PANEL_Z), Color(0.8, 1.0, 0.85))
 	_spark = MeshInstance3D.new()
-	_spark.material_override = _flat(Color(0.55, 0.85, 0.65))
+	_spark.material_override = _flat(COL_GREEN)
 	_console.add_child(_spark)
 	_time_label = _make_label("", Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y + SPARK_H + 0.04, PANEL_Z), 24)
-	_make_label("Correct answers on test digits, through training", Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y - 0.035, PANEL_Z), 20, Color(0.6, 0.64, 0.7))
+	_make_label("Correct answers on test digits, through training", Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y - 0.026, PANEL_Z), 16, COL_TEXT_DIM)
 	var ids := [["start", "Start"], ["reverse", "Reverse"], ["play", "Play"], ["slower", "Slower"], ["faster", "Faster"], ["end", "End"]]
 	var bw := w / ids.size()
 	for i in ids.size():
@@ -336,22 +480,41 @@ func _button(id: String) -> Dictionary:
 func _setup_vr() -> void:
 	vr = true
 	get_viewport().use_xr = true
+	# VR renders two large eyes at the headset's refresh rate, so trim the costliest parts:
+	# a lower render resolution, and no screen-space reflections (expensive, and they
+	# differ between the eyes).
+	get_viewport().scaling_3d_mode = Viewport.SCALING_3D_MODE_BILINEAR
+	get_viewport().scaling_3d_scale = VR_RENDER_SCALE
+	_env.ssr_enabled = false
+	# No MSAA in VR: with thousands of thin tube edges it is the costliest single effect.
+	# (FXAA instead turned the headset view black with D3D12, so no smoothing for now.)
+	get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+	RenderingServer.viewport_set_measure_render_time(get_viewport().get_viewport_rid(), true)
+	var xr := XRServer.find_interface("OpenXR")
+	print("VR: render target %s per eye (x%.2f), display %.0f Hz" % [
+		xr.get_render_target_size(), VR_RENDER_SCALE, xr.get_display_refresh_rate()])
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	var origin := XROrigin3D.new()
 	add_child(origin)
 	origin.transform = _station
-	origin.add_child(XRCamera3D.new())
+	_origin = origin
+	_xr_cam = XRCamera3D.new()
+	origin.add_child(_xr_cam)
+	_build_vignette()
 	for hand in ["left_hand", "right_hand"]:
 		var ctrl := XRController3D.new()
 		ctrl.tracker = hand
 		ctrl.pose = "aim"
 		origin.add_child(ctrl)
-		var grip_box := MeshInstance3D.new()
-		var b := BoxMesh.new()
-		b.size = Vector3(0.03, 0.03, 0.1)
-		grip_box.mesh = b
-		grip_box.position.z = 0.05
-		ctrl.add_child(grip_box)
+		_hands.append(ctrl)
+		# The hand models sit in the palm; this node moves them from the aim pose (which the
+		# lasers use) to where your real hand is.
+		var offset := XRToolsHandAimOffset.new()
+		ctrl.add_child(offset)
+		var model := _make_hand(hand == "left_hand")
+		offset.add_child(model)
+		_hand_models.append(model)
+		_palms.append(offset)
 		var laser := MeshInstance3D.new()
 		var lb := BoxMesh.new()
 		lb.size = Vector3(0.003, 0.003, 1.0)
@@ -361,6 +524,153 @@ func _setup_vr() -> void:
 		laser.material_override = lm
 		ctrl.add_child(laser)
 		_pointers.append({"ctrl": ctrl, "laser": laser, "trigger": false, "grip": false, "scrubbing": false})
+	_hand_rest = Node3D.new()
+	_hand_rest.top_level = true
+	add_child(_hand_rest)
+
+
+## A hand from Godot XR Tools (MIT; hand models CC0): its fingers follow trigger and grip,
+## and it lines itself up with the controller's aim pose. Dark glass with a white rim.
+func _make_hand(left: bool) -> Node3D:
+	var mat := ShaderMaterial.new()
+	mat.shader = Shader.new()
+	mat.shader.code = """
+shader_type spatial;
+void fragment() {
+	float rim = pow(1.0 - clamp(dot(NORMAL, VIEW), 0.0, 1.0), 2.5);
+	ALBEDO = vec3(0.02, 0.015, 0.03);
+	ROUGHNESS = 0.2;
+	SPECULAR = 0.6;
+	EMISSION = vec3(1.0) * rim * 1.5;   // white
+}
+"""
+	var model: XRToolsHand = load("res://addons/godot-xr-tools/hands/scenes/lowpoly/%s_hand_low.tscn"
+		% ("left" if left else "right")).instantiate()
+	model.hand_material_override = mat
+	# Set before the hand enters the tree: it keeps this transform relative to its target.
+	model.scale = Vector3.ONE * HAND_SCALE
+	return model
+
+
+## Comfort vignette: dark edges that close in while you move or turn. A quad just in
+## front of the eyes, drawn over everything.
+func _build_vignette() -> void:
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+render_mode unshaded, cull_disabled, depth_test_disabled, depth_draw_never, blend_mix, fog_disabled, shadows_disabled;
+uniform float strength = 0.0;   // 0 = clear view, 1 = only a small window left
+void fragment() {
+	// The quad spans about 144 degrees; a headset shows roughly the middle 100 (r < 0.4).
+	float r = length(UV - 0.5) * 2.0;
+	float inner = mix(0.5, 0.12, strength);
+	ALBEDO = vec3(0.0);
+	ALPHA = smoothstep(inner, inner + 0.15, r) * step(0.001, strength);
+}
+"""
+	_vignette = ShaderMaterial.new()
+	_vignette.shader = sh
+	_vignette.render_priority = 127
+	var q := MeshInstance3D.new()
+	var qm := QuadMesh.new()
+	qm.size = Vector2(0.5, 0.5)
+	q.mesh = qm
+	q.material_override = _vignette
+	q.position = Vector3(0, 0, -0.08)
+	q.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
+	_xr_cam.add_child(q)
+
+
+## Where the visitor's eyes are, in VR or on desktop.
+func _head_pos() -> Vector3:
+	return _xr_cam.global_position if vr else _cam.global_position
+
+
+func _stick(hand: int) -> Vector2:
+	var v: Vector2 = _hands[hand].get_vector2("primary")
+	return v if v.length() > STICK_DEADZONE else Vector2.ZERO
+
+
+## VR movement: fly where the left controller points, rise and sink and snap-turn with the
+## right stick, or (holding a cable) pull along it by hand and edit it with either stick.
+func _vr_move(delta: float) -> void:
+	var left := _stick(0)
+	var right := _stick(1)
+	# Snap turn on the right stick, around your head; it must come back to centre first.
+	if absf(right.x) > 0.7 and _snap_ready:
+		_snap_ready = false
+		_snap_flash = 1.0
+		var pivot := _xr_cam.global_position
+		var turn := Transform3D(Basis(Vector3.UP, deg_to_rad(-SNAP_ANGLE * signf(right.x))), Vector3.ZERO)
+		_origin.global_transform = Transform3D(Basis(), pivot) * turn * Transform3D(Basis(), -pivot) * _origin.global_transform
+	elif absf(right.x) < 0.3:
+		_snap_ready = true
+	_snap_flash = maxf(0.0, _snap_flash - delta * 4.0)
+
+	if not _grab.is_empty():
+		_vel = Vector3.ZERO
+		_vr_hold_cable(delta, left, right)
+	else:
+		var aim: XRController3D = _hands[0]
+		var boost := 4.0 if aim.is_button_pressed("primary_click") else 1.0
+		var rise := right.y if absf(right.y) > absf(right.x) else 0.0
+		var want := (-aim.global_basis.z * left.y + aim.global_basis.x * left.x) * FLY_SPEED * boost
+		want += Vector3.UP * rise * FLY_SPEED * 0.6
+		_vel = _vel.lerp(want, 1.0 - exp(-delta * 8.0))
+		_origin.global_position += _vel * delta
+	var moving := clampf(_vel.length() / FLY_SPEED, 0.0, 1.0) * 0.55
+	if not _grab.is_empty():
+		moving = clampf(_grab.get("speed", 0.0) / FLY_SPEED, 0.0, 1.0) * 0.55
+	_vignette.set_shader_parameter("strength", maxf(moving, _snap_flash * 0.7))
+	_place_hands()
+
+
+## XR Tools moves its hands in the physics step (60 Hz, before our movement), so while you
+## fly they trail behind. Put them in place again every frame, after moving.
+func _place_hands() -> void:
+	for i in _hand_models.size():
+		var model: XRToolsHand = _hand_models[i]
+		var held: bool = not _grab.is_empty() and _grab.get("model") == model
+		var target: Transform3D = _hand_rest.global_transform if held else (_palms[i] as Node3D).global_transform
+		model.global_transform = target * model._transform
+
+
+## Holding a cable in VR, like a rope: the hand stays where it took hold, so moving the
+## hand moves you instead. Along the cable the pull is amplified, to cross the distances.
+## The hand is drawn resting on the cable's surface.
+func _vr_hold_cable(delta: float, left: Vector2, right: Vector2) -> void:
+	var a: Vector3 = _grab.a
+	var b: Vector3 = _grab.b
+	var length := a.distance_to(b)
+	var tangent := (b - a).normalized()
+	var hand: XRController3D = _grab.hand
+	var hand_pos := hand.position
+	# Pull: moving the hand back along the cable moves you forward, and vice versa. Holding
+	# the hand still on the cable already moves you 1:1; the extra here adds the gain.
+	var moved: Vector3 = _origin.global_basis * (hand_pos - (_grab.hand_last as Vector3))
+	var margin := (NetworkView.BALL + 2.0) / length
+	var before: float = _grab.s
+	_grab.s = clampf(_grab.s - moved.dot(tangent) * (VR_PULL_GAIN - 1.0) / length,
+		0.0 if _grab.edge < 12544 else margin, 1.0 - margin)
+	_grab.speed = absf(_grab.s - before) * length / maxf(delta, 1e-4)
+	_grab.hand_last = hand_pos
+	# Where the palm rests: on the surface, on the side it took hold, turned as it was.
+	var c: Vector3 = view.to_global(view.edge_point(_grab.edge, _grab.s))
+	var r: float = view.edge_width(_grab.edge) / 2.0
+	var rest := Transform3D(_grab.palm_basis, c + (_grab.radial as Vector3) * (r + 0.03 * HAND_SCALE))
+	_hand_rest.global_transform = rest
+	# Move yourself so the controller is where that resting hand needs it.
+	var want: Transform3D = rest * (_grab.ctrl_from_palm as Transform3D)
+	_origin.global_position += want.origin - hand.global_position
+	# Either stick up or down edits the held cable's weight, a notch at a time.
+	var y := left.y if absf(left.y) > absf(right.y) else right.y
+	if absf(y) > 0.5:
+		_edit_t -= delta
+		if _edit_t <= 0.0:
+			_nudge_grabbed(1 if y > 0.0 else -1)
+			_edit_t = VR_EDIT_INTERVAL
+	else:
+		_edit_t = 0.0
 
 
 func _setup_desktop() -> void:
@@ -415,6 +725,10 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_camera_view(2)
 			KEY_3:
 				_set_camera_view(3)
+			KEY_K:
+				_toggle_all_hidden()
+			KEY_C:
+				_summon_console()
 
 
 func _process(delta: float) -> void:
@@ -451,6 +765,15 @@ func _process(delta: float) -> void:
 
 
 func _after_camera(delta: float) -> void:
+	if vr and not _hands.is_empty():
+		var down: bool = (_hands[0] as XRController3D).is_button_pressed("by_button")
+		if down and not _summon_was_down:
+			_summon_console()
+		_summon_was_down = down
+	_move_console(delta)
+	if vr:
+		_vr_move(delta)
+		_report_performance(delta)
 	for p in _pointers:
 		_update_pointer(p)
 	_advance_timeline(delta)
@@ -547,9 +870,19 @@ func _update_pointer(p: Dictionary) -> void:
 			pad.end_stroke()
 			_pulse_on_meta = true
 		p.scrubbing = false
-	if grip and not p.grip and kind == "node" and h.layer < 3:
+	# In VR the grip first grabs a cable right under the hand; otherwise it switches the
+	# neuron the laser points at.
+	var grabbed := false
+	if grip and not p.grip and p.ctrl and _grab.is_empty():
+		var g: Dictionary = view.nearest_edge(_palm(p.ctrl).origin, VR_GRAB_RANGE)
+		if not g.is_empty():
+			_start_grab(g.edge, g.s, p.ctrl)
+			grabbed = true
+	if grip and not p.grip and not grabbed and kind == "node" and h.layer < 3 and (not p.ctrl or h.t <= VR_TOGGLE_RANGE):
 		client.send({"type": "toggle_neuron", "layer": h.layer, "neuron": h.neuron})
 		_pulse_on_meta = true
+	if not grip and p.grip and p.ctrl and not _grab.is_empty() and _grab.get("hand") == p.ctrl:
+		_end_grab()
 	p.trigger = trig
 	p.grip = grip
 
@@ -596,24 +929,71 @@ func _hit(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 	return best
 
 
+## In VR, print frame rate and frame time every two seconds, to the Output panel.
+func _report_performance(delta: float) -> void:
+	_perf_t += delta
+	if _perf_t < 2.0:
+		return
+	_perf_t = 0.0
+	var xr := XRServer.find_interface("OpenXR")
+	var rid := get_viewport().get_viewport_rid()
+	print("VR: %d fps (headset %.0f Hz, budget %.1f ms) | GPU %.1f ms | CPU render %.1f ms | script %.1f ms" % [
+		Engine.get_frames_per_second(), xr.get_display_refresh_rate(), 1000.0 / maxf(xr.get_display_refresh_rate(), 1.0),
+		RenderingServer.viewport_get_measured_render_time_gpu(rid),
+		RenderingServer.viewport_get_measured_render_time_cpu(rid),
+		Performance.get_monitor(Performance.TIME_PROCESS) * 1000.0])
+
+
 # ------------------------------------------------------------------ holding a line
 
 const GRAB_REACH := 1.5   # how far from the line's surface you hang, metres
 
 
-func _start_grab(e: int, s: float) -> void:
+func _start_grab(e: int, s: float, hand: XRController3D = null) -> void:
 	var ends: Array = view.edge_ends(e)
 	var a: Vector3 = view.to_global(ends[0])
 	var b: Vector3 = view.to_global(ends[1])
 	var p: Vector3 = view.to_global(view.edge_point(e, s))
-	var away := _cam.global_position - p
+	var away := _head_pos() - p
 	# Hang beside the line, on the side you came from.
 	away -= (b - a).normalized() * away.dot((b - a).normalized())
 	if away.length() < 1e-3:
 		away = Vector3.UP
 	var offset: Vector3 = away.normalized() * (view.edge_width(e) / 2 + GRAB_REACH)
 	_grab = {"edge": e, "a": a, "b": b, "s": s, "offset": offset}
+	if hand:
+		# Hold on where the hand is: remember where it sits around the cable and how it is
+		# turned, relative to the cable, so both stay put while you hang on.
+		var c: Vector3 = view.to_global(view.edge_point(e, s))
+		var palm := _palm(hand)
+		var radial: Vector3 = palm.origin - c
+		radial -= (b - a).normalized() * radial.dot((b - a).normalized())
+		if radial.length() < 1e-3:
+			radial = Vector3.UP
+		_grab.hand = hand
+		_grab.hand_last = hand.position
+		_grab.radial = radial.normalized()
+		_grab.palm_basis = palm.basis
+		_grab.ctrl_from_palm = palm.affine_inverse() * hand.global_transform
+		var model: XRToolsHand = _hand_models[_hands.find(hand)]
+		model.add_target_override(_hand_rest, 10)
+		_grab.model = model
 	view.set_grabbed(e)
+
+
+## Where a VR hand's palm is (the hand model's own frame).
+func _palm(ctrl: XRController3D) -> Transform3D:
+	return (_palms[_hands.find(ctrl)] as Node3D).global_transform
+
+
+## Debug (desktop key K): switch every hidden neuron off, or all back on if any are off.
+func _toggle_all_hidden() -> void:
+	var any_off: bool = not view.off[1].is_empty() or not view.off[2].is_empty()
+	for layer in [1, 2]:
+		for j in 16:
+			if view.off[layer].has(j) == any_off:
+				client.send({"type": "toggle_neuron", "layer": layer, "neuron": j})
+	_pulse_on_meta = true
 
 
 ## Change the held line's weight by `steps` (each 5% of its layer's largest weight).
@@ -626,6 +1006,8 @@ func _nudge_grabbed(steps: int) -> void:
 
 
 func _end_grab() -> void:
+	if _grab.has("model"):
+		(_grab.model as XRToolsHand).remove_target_override(_hand_rest)
 	_grab = {}
 	view.set_grabbed(-1)
 
@@ -750,6 +1132,12 @@ func _run_screenshot_demo() -> void:
 	if screenshot_at >= 0:
 		playhead = float(screenshot_at)
 	_set_camera_view(screenshot_view)
+	if "nomsaa" in _perf_flags:
+		get_viewport().msaa_3d = Viewport.MSAA_DISABLED
+		get_viewport().screen_space_aa = Viewport.SCREEN_SPACE_AA_FXAA
+	if "noglow" in _perf_flags: _env.glow_enabled = false
+	if "nofog" in _perf_flags: _env.fog_enabled = false
+	if "nossr" in _perf_flags: _env.ssr_enabled = false
 	if screenshot_cam != null:
 		_cam.position = view.to_global(screenshot_cam)
 		_cam.look_at(view.to_global(screenshot_look if screenshot_look != null else Vector3(0, NetworkView.GRID_Y, NetworkView.MID_Z)))
@@ -760,6 +1148,17 @@ func _run_screenshot_demo() -> void:
 	pad.continue_stroke(Vector2(0.52, 0.55))
 	pad.continue_stroke(Vector2(0.44, 0.8))
 	pad.end_stroke()
+	if screenshot_summon:
+		_summon_console()
+	if screenshot_hands:
+		for left in [true, false]:
+			# The hand keeps the transform it has when added, relative to its parent.
+			var h := _make_hand(left)
+			h.position = Vector3(-0.12 if left else 0.12, -0.08, -0.4)
+			h.rotation = Vector3(deg_to_rad(-60.0), 0, 0)
+			_cam.add_child(h)
+	if screenshot_off.x > 0:
+		client.send({"type": "toggle_neuron", "layer": screenshot_off.x, "neuron": screenshot_off.y})
 	if screenshot_grab:
 		var vp := get_viewport().get_visible_rect().size / 2
 		var g: Dictionary = view.pick_edge(_cam.project_ray_origin(vp), _cam.project_ray_normal(vp))
@@ -787,5 +1186,5 @@ func _run_screenshot_demo() -> void:
 	print("Frame time: %.2f ms" % ((Time.get_ticks_usec() - t1) / 1000.0 / maxi(Engine.get_frames_drawn() - f0, 1)))
 	await RenderingServer.frame_post_draw
 	get_viewport().get_texture().get_image().save_png(screenshot_path)
-	print("Screenshot saved: ", screenshot_path, " at snapshot ", shown_index, " answer ", view._answer.text)
+	print("Screenshot saved: ", screenshot_path, " at snapshot ", shown_index, " answer ", view._answer.text, " off ", view.off)
 	get_tree().quit()

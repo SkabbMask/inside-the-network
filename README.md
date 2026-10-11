@@ -41,6 +41,8 @@ signal it carries. While the timeline plays, the pulse repeats like a heartbeat.
 | Look (turn / tilt) | Arrow keys, or middle-drag |
 | Fly / up, down / faster | WASD / U, J / hold Shift |
 | Grab a line, pull yourself along it, let go | Hold left mouse on it, W / S, release |
+| Bring the console to you | C |
+| Debug: switch every hidden neuron off / back on | K |
 
 Timeline: Start, Reverse, Play, Slower, Faster, End, or drag along the curve.
 The curve is the share of test digits answered correctly. Time runs by snapshot, so the
@@ -48,9 +50,32 @@ first 200 training steps (where most of the change happens) play in more detail.
 
 ## VR
 
-OpenXR is switched off in Project Settings for now, because enabling it crashed
-Godot at start-up on our first test machine. To try VR: Project Settings → XR → OpenXR
-→ Enabled. VR controls: trigger = left mouse, grip = right mouse.
+OpenXR is on, and the project renders with Direct3D 12 on Windows
+(`rendering_device/driver.windows`). With Vulkan, Godot 4.7 crashed while creating the
+graphics device through OpenXR (SteamVR 2.17, AMD RX 6800); D3D12 works. If VR starts
+in a window instead, check that SteamVR is the active OpenXR runtime.
+VR controls:
+
+| | |
+|---|---|
+| Fly where the left controller points / boost | Left stick / click it in |
+| Snap turn 30° / rise, sink | Right stick left, right / up, down |
+| Draw, press buttons, select a neuron, drag the timeline | Trigger (laser) |
+| Switch a hidden neuron off / on | Grip, pointing at it (within one neuron spacing, ~120 m) |
+| Hold on to a cable, pull along it hand over hand | Grip with the hand near the cable (within ~6 m); move the hand |
+| Make the held cable's weight stronger / weaker | Either stick up / down |
+| Bring the console to you | B on the left controller |
+
+The view darkens at the edges while you move or snap-turn, to reduce motion sickness.
+
+Console housing: "computer-wide" from Kenney's Space Station Kit (CC0, www.kenney.nl),
+in `godot/assets/kenney`.
+
+Console font: VT323 by Peter Hull (SIL Open Font License 1.1), in `godot/assets/fonts`
+with its licence.
+
+VR hands: [Godot XR Tools](https://github.com/GodotVR/godot-xr-tools) 4.5.1 (MIT), in
+`godot/addons/godot-xr-tools`; its hand models by DigitalN8m4r3 are CC0.
 
 Data: MNIST (LeCun, Cortes & Burges). Network size follows 3Blue1Brown's
 "But what is a neural network?".

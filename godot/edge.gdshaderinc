@@ -7,6 +7,7 @@ uniform sampler2D edge_a : filter_nearest, repeat_disable;
 uniform sampler2D edge_b : filter_nearest, repeat_disable;
 uniform float blend = 1.0;
 uniform int tex_w = 128;
+uniform int id_offset = 0;        // lines come in two batches (fine image lines, cables)
 uniform int mode = 0;             // 0 = your drawing, 1 = all weights
 uniform float focus_node = -1.0;  // global node id, or -1
 uniform float faded_alpha = 0.06;  // lines not touching the selected neuron
@@ -24,6 +25,7 @@ uniform float grid_cells = 6.0;   // wires around a tube per metre of diameter (
 // Slack: every line hangs and sways a little, like a loose cable floating in space. This
 // is decoration only: the curve carries no information. Ends stay fixed.
 uniform float sway_t = 0.0;       // time, set from the scene (so grabbing can follow)
+uniform float grab_sway_t = 0.0;  // the held line stays frozen at the moment it was grabbed
 uniform float slack = 0.025;      // how far the middle of a line strays, per metre of length
 uniform float grid_line = 0.07;   // wire thickness, as a share of a grid cell
 uniform float rim_power = 3.0;    // how tightly the glow hugs a tube's silhouette
@@ -82,7 +84,7 @@ vec3 back_point(int layer, int dst) {
 }
 
 void vertex() {
-	int id = INSTANCE_ID;
+	int id = INSTANCE_ID + id_offset;
 	ivec2 tc = ivec2(id % tex_w, id / tex_w);
 	vec2 d = mix(texelFetch(edge_a, tc, 0).rg, texelFetch(edge_b, tc, 0).rg, blend);
 	float w = d.r;
@@ -118,12 +120,18 @@ void vertex() {
 	float t = max(min_width, (layer == 0 ? max_width_input : max_width) * abs(w));
 	v_len = length(dir);
 	v_width = t;
-	v_grab = abs(float(INSTANCE_ID) - grab_edge) < 0.5 ? 1.0 : 0.0;
+	v_grab = abs(float(id) - grab_edge) < 0.5 ? 1.0 : 0.0;
 	// Bend the line: the middle strays by `bend`, the ends stay put (sin 0 = sin pi = 0).
 	float ph = fract(float(id) * 0.618034) * 6.2831853;
-	vec3 bend = slack * v_len * (vec3(0.0, -0.6, 0.0)
-		+ side * sin(sway_t * 0.35 + ph) * 0.8
-		+ up2 * cos(sway_t * 0.27 + ph * 1.3) * 0.8);
+	// Pixel lines are straight (their mesh has no segments to bend, which keeps the
+	// 12,544 of them cheap); the cables between neurons sag and sway.
+	vec3 bend = vec3(0.0);
+	float st = abs(float(id) - grab_edge) < 0.5 ? grab_sway_t : sway_t;
+	if (layer > 0) {
+		bend = slack * v_len * (vec3(0.0, -0.6, 0.0)
+			+ side * sin(st * 0.35 + ph) * 0.8
+			+ up2 * cos(st * 0.27 + ph * 1.3) * 0.8);
+	}
 	float sb = sin(PI * v_along);
 	vec3 centre = a + dir * v_along + bend * sb;
 	vec3 tang = normalize(dir + bend * PI * cos(PI * v_along));

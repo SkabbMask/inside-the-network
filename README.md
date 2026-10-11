@@ -40,6 +40,7 @@ signal it carries. While the timeline plays, the pulse repeats like a heartbeat.
 | Camera: at the console / further back, overview / in front of the input, to draw | 1 / 2 / 3 |
 | Look (turn / tilt) | Arrow keys, or middle-drag |
 | Fly / up, down / faster | WASD / U, J / hold Shift |
+| Grab a line, pull yourself along it, let go | Hold left mouse on it, W / S, release |
 
 Timeline: Start, Reverse, Play, Slower, Faster, End, or drag along the curve.
 The curve is the share of test digits answered correctly. Time runs by snapshot, so the

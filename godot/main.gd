@@ -20,7 +20,7 @@ const BAR_X1 := -0.38
 const BAR_Y := 0.9
 const SPARK_H := 0.1
 const CONSOLE_DISTANCE := 1.6   # from the middle of the network, sideways, in grid widths
-const FLY_SPEED := 8.0          # metres per second; hold Shift for 4x
+const FLY_SPEED := 40.0         # metres per second; hold Shift for 4x
 
 const COL_BTN := Color(0.17, 0.19, 0.24)
 const COL_BTN_HOVER := Color(0.3, 0.33, 0.4)
@@ -35,6 +35,7 @@ var screenshot_center := false
 var screenshot_cam = null    # Vector3 in network coordinates, or null for a preset view
 var screenshot_look = null
 var screenshot_select := Vector2i(-1, -1)
+var screenshot_grab := false
 
 var client
 var view
@@ -75,6 +76,7 @@ var _yaw := 0.0
 var _pitch := 0.0
 var _mouse_left := false
 var _mouse_right := false
+var _grab := {}   # the line you are holding: {edge, a, b, s, offset}
 
 
 func _ready() -> void:
@@ -93,6 +95,8 @@ func _ready() -> void:
 			screenshot_cam = _vec3_arg(a.trim_prefix("--cam="))
 		elif a.begins_with("--look="):
 			screenshot_look = _vec3_arg(a.trim_prefix("--look="))
+		elif a == "--grab":
+			screenshot_grab = true
 		elif a.begins_with("--select="):
 			var p := a.trim_prefix("--select=").split(",")
 			screenshot_select = Vector2i(int(p[0]), int(p[1]))
@@ -183,15 +187,24 @@ func _build_world() -> void:
 	env.background_color = Color(0.03, 0.035, 0.05)
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_COLOR
 	env.ambient_light_color = Color(0.4, 0.42, 0.5)
+	# Fog fades far lines towards the background, so near ones stand out.
+	env.fog_enabled = true
+	env.fog_light_color = Color(0.03, 0.035, 0.05)
+	env.fog_density = 0.0025
 	env.glow_enabled = true
 	env.glow_intensity = 0.6
 	env.glow_bloom = 0.05
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
+	# One light from above and to the side, to shade the round lines.
+	var sun := DirectionalLight3D.new()
+	sun.rotation = Vector3(deg_to_rad(-50), deg_to_rad(35), 0)
+	sun.light_energy = 1.1
+	add_child(sun)
 	_floor = MeshInstance3D.new()
 	var plane := PlaneMesh.new()
-	plane.size = Vector2(400, 400)
+	plane.size = Vector2(4000, 4000)
 	_floor.mesh = plane
 	_floor.material_override = _flat(Color(0.055, 0.06, 0.075))
 	_floor.position.y = -0.002
@@ -331,6 +344,7 @@ func _setup_vr() -> void:
 func _setup_desktop() -> void:
 	_cam = Camera3D.new()
 	_cam.fov = 75
+	_cam.far = 6000.0
 	add_child(_cam)
 	_set_camera_view(1)
 	_cam.make_current()
@@ -345,7 +359,7 @@ func _set_camera_view(n: int) -> void:
 	if n == 1:
 		_cam.position = _station * Vector3(0.0, 1.9, 1.6)
 	elif n == 2:
-		_cam.position = _station * Vector3(0.0, 25.0, 40.0)
+		_cam.position = _station * Vector3(0.0, NetworkView.GRID_SIZE * 0.4, NetworkView.GRID_SIZE * 0.6)
 	else:
 		_cam.position = view.to_global(Vector3(0.0, NetworkView.GRID_Y, NetworkView.GRID_SIZE * 1.1))
 		mid = view.to_global(Vector3(0, NetworkView.GRID_Y, 0))
@@ -392,6 +406,11 @@ func _process(delta: float) -> void:
 			_pitch = clampf(_pitch + tilt * delta * 1.5, -1.3, 1.3)
 			_cam.rotation = Vector3(_pitch, _yaw, 0)
 
+		if not _grab.is_empty():
+			_move_along_grab(delta)
+			_after_camera(delta)
+			return
+
 		# WASD walks on the horizontal plane in the facing direction; U/J move along world Y.
 		var move := Vector3.ZERO
 		if Input.is_key_pressed(KEY_W): move.z -= 1
@@ -403,7 +422,10 @@ func _process(delta: float) -> void:
 		if move != Vector3.ZERO:
 			var speed := FLY_SPEED * (4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0)
 			_cam.position += (Basis(Vector3.UP, _yaw) * move.normalized()) * delta * speed
+	_after_camera(delta)
 
+
+func _after_camera(delta: float) -> void:
 	for p in _pointers:
 		_update_pointer(p)
 	_advance_timeline(delta)
@@ -468,6 +490,15 @@ func _update_pointer(p: Dictionary) -> void:
 
 	var kind: String = h.get("kind", "")
 	var trig_down: bool = trig and not p.trigger
+	# Clicking a line (nearer than anything else under the pointer) grabs it; letting go
+	# releases it.
+	if trig_down and not p.ctrl and kind != "button":
+		var g: Dictionary = view.pick_edge(origin, dir)
+		if not g.is_empty() and (kind == "" or g.t < h.t):
+			_start_grab(g.edge, g.s)
+			kind = "grab"
+	if not trig and not _grab.is_empty() and not p.ctrl:
+		_end_grab()
 	if trig_down:
 		match kind:
 			"button":
@@ -537,6 +568,49 @@ func _hit(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 		if f != null:
 			best["frac"] = f
 	return best
+
+
+# ------------------------------------------------------------------ holding a line
+
+const GRAB_REACH := 1.5   # how far from the line's surface you hang, metres
+
+
+func _start_grab(e: int, s: float) -> void:
+	var ends: Array = view.edge_ends(e)
+	var a: Vector3 = view.to_global(ends[0])
+	var b: Vector3 = view.to_global(ends[1])
+	var p := a.lerp(b, s)
+	var away := _cam.global_position - p
+	# Hang beside the line, on the side you came from.
+	away -= (b - a).normalized() * away.dot((b - a).normalized())
+	if away.length() < 1e-3:
+		away = Vector3.UP
+	var offset: Vector3 = away.normalized() * (view.edge_width(e) / 2 + GRAB_REACH)
+	_grab = {"edge": e, "a": a, "b": b, "s": s, "offset": offset}
+	view.set_grabbed(e)
+
+
+func _end_grab() -> void:
+	_grab = {}
+	view.set_grabbed(-1)
+
+
+## While holding a line, W pulls you along it towards where you look, S the other way.
+## You stop just short of the neuron at either end.
+func _move_along_grab(delta: float) -> void:
+	var a: Vector3 = _grab.a
+	var b: Vector3 = _grab.b
+	var length := a.distance_to(b)
+	var pull := 0.0
+	if Input.is_key_pressed(KEY_W): pull += 1
+	if Input.is_key_pressed(KEY_S): pull -= 1
+	var look := -_cam.global_basis.z
+	var toward_b := 1.0 if (b - a).dot(look) >= 0.0 else -1.0
+	var speed := FLY_SPEED * (4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0)
+	var margin := (NetworkView.CUBE * 0.5 + 2.0) / length
+	_grab.s = clampf(_grab.s + pull * toward_b * speed * delta / length, 0.0 if _grab.edge < 12544 else margin, 1.0 - margin)
+	var target: Vector3 = a.lerp(b, _grab.s) + _grab.offset
+	_cam.global_position = _cam.global_position.lerp(target, 1.0 - exp(-delta * 6.0))
 
 
 # ------------------------------------------------------------------ server messages
@@ -647,6 +721,12 @@ func _run_screenshot_demo() -> void:
 	pad.continue_stroke(Vector2(0.52, 0.55))
 	pad.continue_stroke(Vector2(0.44, 0.8))
 	pad.end_stroke()
+	if screenshot_grab:
+		var vp := get_viewport().get_visible_rect().size / 2
+		var g: Dictionary = view.pick_edge(_cam.project_ray_origin(vp), _cam.project_ray_normal(vp))
+		print("Grab: ", g, " picked in ", Time.get_ticks_msec() - t0, " ms (since start)")
+		if not g.is_empty():
+			_start_grab(g.edge, g.s)
 	if screenshot_select.x > 0:
 		view.select(screenshot_select.x, screenshot_select.y)
 	for i in 90:

@@ -15,13 +15,13 @@ const EDGE_TEX_H := 102
 
 # The whole network is built large, so you fly between neurons and the lines (which keep
 # their real thickness in millimetres) have room to stay apart. Distances scale with SPREAD.
-const SPREAD := 10.0
+const SPREAD := 90.0
 const LAYER_Z := [0.0, -3.6 * SPREAD, -6.2 * SPREAD, -8.8 * SPREAD]
 const MID_Z := -4.4 * SPREAD
 # Every slice (the input image and both hidden grids) is a square this wide, in metres,
 # standing upright, with its lowest neurons GRID_FLOOR above the floor.
 const GRID_SIZE := 4.0 * SPREAD
-const GRID_FLOOR := 2.0
+const GRID_FLOOR := 20.0
 const GRID_Y := GRID_FLOOR + GRID_SIZE / 2
 const ANSWER_WIDTH := 6.5 * SPREAD
 const LABEL_PIXEL := 0.0035 * SPREAD   # text size in the network, metres per font pixel
@@ -29,8 +29,19 @@ const LABEL_PIXEL := 0.0035 * SPREAD   # text size in the network, metres per fo
 # that layer: a 28 x 28 grid for the pixels, or the 4 x 4 seats of the hidden grid. Each
 # incoming line ends at its own point there; the one outgoing value leaves from the
 # middle of the back face.
-const CUBE := 2.0
-const FACE_FILL := 0.9   # share of the face the connection points cover
+const CUBE := 16.0
+const FACE_FILL := 1.0   # the connection points' cells tile the whole face
+# Line diameter is proportional to the weight: MAX_WIDTH for the largest weights of the
+# run, down to MIN_WIDTH, below which lines stay at MIN_WIDTH so they remain visible.
+# Each layer's weights are already on that layer's own scale (see the server), so each
+# layer gets its own ruler: the 12,544 pixel lines are a fine mesh, the 416 lines between
+# neurons thick cables. Both are sized by one rule: if every weight arriving at a face
+# were at the maximum, the tubes would cover just over 90% of it. A round tube covers at
+# most 79% of its own square cell, so it must be 1.12x the cell's width (and overlap its
+# neighbours slightly) to cover 90%. Cells: 4 x 4 on a cube face, 28 x 28 for the pixels.
+const MAX_WIDTH := 1.12 * CUBE / 4.0
+const MAX_WIDTH_INPUT := 1.12 * CUBE / 28.0
+const MIN_WIDTH := 0.05
 const PICK_RADIUS := CUBE * 0.8
 
 const COL_POS := Color(1.0, 0.55, 0.18)
@@ -56,6 +67,7 @@ var off := [[], [], [], []]
 var selected := Vector2i(-1, -1)
 
 var edge_mat: ShaderMaterial
+var edge_data := PackedFloat32Array()
 var _edge_faded_mat: ShaderMaterial
 var _edge_tex := []   # two ImageTextures, alternating
 var _pos_tex := []
@@ -164,8 +176,15 @@ func _build_input() -> void:
 
 
 func _build_edges() -> void:
-	var mesh := BoxMesh.new()
-	mesh.size = Vector3.ONE
+	# Each connection is a round tube: a unit cylinder the shader stretches between neurons.
+	var mesh := CylinderMesh.new()
+	mesh.top_radius = 0.5
+	mesh.bottom_radius = 0.5
+	mesh.height = 1.0
+	mesh.radial_segments = 10
+	mesh.rings = 0
+	mesh.cap_top = false
+	mesh.cap_bottom = false
 	var mm := MultiMesh.new()
 	mm.transform_format = MultiMesh.TRANSFORM_3D
 	mm.use_custom_data = true
@@ -195,6 +214,11 @@ func _build_edges() -> void:
 		_pos_tex.append(ImageTexture.create_from_image(_pos_img))
 	set_edge_param("tex_w", EDGE_TEX_W)
 	set_edge_param("cube", CUBE)
+	set_edge_param("pixel", GRID_SIZE / 28.0)
+	set_edge_param("max_width", MAX_WIDTH)
+	set_edge_param("face_fill", FACE_FILL)
+	set_edge_param("max_width_input", MAX_WIDTH_INPUT)
+	set_edge_param("min_width", MIN_WIDTH)
 	set_edge_param("face_fill", FACE_FILL)
 	set_edge_param("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
 	set_edge_param("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
@@ -264,7 +288,8 @@ func _build_labels() -> void:
 	for l in 4:
 		var y := top + 3.0 * CUBE if l < 3 else GRID_Y + 3.0 * CUBE
 		_label(names[l], Vector3(0, y, LAYER_Z[l]), 44, COL_TEXT, true)
-	_label("Each neuron keeps its place, so you can follow it. Its place in the grid means nothing: every neuron is connected to every pixel.",
+	_label("Each neuron keeps its place, so you can follow it. Its place in the grid means nothing: every neuron is connected to every pixel.
+Line thickness compares weights within one layer, not between layers.",
 		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, Color(0.6, 0.64, 0.72), true)
 	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, Color(0.6, 0.64, 0.72), true)
 	set_center(false)
@@ -429,6 +454,7 @@ func apply_edges(payload: PackedByteArray) -> void:
 	if payload.size() != EDGE_TEX_W * EDGE_TEX_H * 8:
 		return
 	_edge_tex[_cur].update(Image.create_from_data(EDGE_TEX_W, EDGE_TEX_H, false, Image.FORMAT_RGF, payload))
+	edge_data = payload.to_float32_array()   # (weight, flow) per edge, for grabbing
 
 
 func apply_nodes(payload: PackedByteArray) -> void:
@@ -481,6 +507,82 @@ func _recolor() -> void:
 
 func set_mode(flow: bool) -> void:
 	set_edge_param("mode", 0 if flow else 1)
+
+
+# ------------------------------------------------------------------ lines, for grabbing
+
+const N_EDGES := 784 * 16 + 16 * 16 + 16 * 10
+
+
+## Where a node sits: input pixels on the image, neurons at their cube's centre.
+func _node_center(id: int) -> Vector3:
+	return input_pos[id] if id < 784 else pos_now[id - 784]
+
+
+## End points of edge `e` (same order and geometry as edge.gdshaderinc), in local space:
+## from the pixel or the sender's back face, to the receiver's front-face point.
+func edge_ends(e: int) -> Array:
+	var layer: int
+	var src: int
+	var dst: int
+	if e < 12544:
+		layer = 0; dst = 784 + e / 784; src = e % 784
+	elif e < 12800:
+		layer = 1; dst = 800 + (e - 12544) / 16; src = 784 + (e - 12544) % 16
+	else:
+		layer = 2; dst = 816 + (e - 12800) / 16; src = 800 + (e - 12800) % 16
+	var a := _node_center(src) + _back_point(layer, dst)
+	var n := 28 if layer == 0 else 4
+	var i := src if layer == 0 else (src - 784 if layer == 1 else src - 800)
+	var f := CUBE * FACE_FILL
+	var fp := Vector3(((i % n) + 0.5) / n - 0.5, 0.5 - ((i / n) + 0.5) / n, 0) * f + Vector3(0, 0, CUBE / 2)
+	return [a, _node_center(dst) + fp]
+
+
+## Same as back_point() in edge.gdshaderinc.
+func _back_point(layer: int, dst: int) -> Vector3:
+	var i := dst - 784 if layer == 0 else (dst - 800 if layer == 1 else dst - 816)
+	var size := GRID_SIZE / 28.0 * FACE_FILL if layer == 0 else CUBE * FACE_FILL
+	var z := 0.0 if layer == 0 else -CUBE / 2
+	return Vector3((((i % 4) + 0.5) / 4.0 - 0.5) * size, (0.5 - ((i / 4) + 0.5) / 4.0) * size, z)
+
+
+func edge_width(e: int) -> float:
+	var w := absf(edge_data[e * 2]) if edge_data.size() > e * 2 else 0.0
+	return maxf(MIN_WIDTH, (MAX_WIDTH_INPUT if e < 12544 else MAX_WIDTH) * w)
+
+
+## The line a ray points at: {edge, t (along the ray), s (0..1 along the line)}, or {}.
+## Lines count as a little thicker the further away they are, so distant ones can be grabbed.
+func pick_edge(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
+	var o := to_local(world_origin)
+	var d := (global_basis.inverse() * world_dir).normalized()
+	var best := {}
+	var best_t := INF
+	for e in N_EDGES:
+		var ends := edge_ends(e)
+		var a: Vector3 = ends[0]
+		var u: Vector3 = ends[1] - a
+		var w := o - a
+		var uu := u.dot(u)
+		var ud := u.dot(d)
+		var denom := uu - ud * ud
+		if denom < 1e-9:
+			continue
+		var s := clampf((u.dot(w) - ud * d.dot(w)) / denom, 0.0, 1.0)
+		var t := (a + u * s - o).dot(d)
+		if t <= 0.0 or t >= best_t:
+			continue
+		var gap := (o + d * t).distance_to(a + u * s)
+		if gap < edge_width(e) / 2 + t * 0.004:
+			best_t = t
+			best = {"edge": e, "t": t, "s": s}
+	return best
+
+
+## Light up the grabbed line (or none with -1).
+func set_grabbed(e: int) -> void:
+	set_edge_param("grab_edge", float(e))
 
 
 # ------------------------------------------------------------------ picking and selection

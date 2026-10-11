@@ -52,6 +52,9 @@ const COL_LIT := Color(1.0, 0.86, 1.0)
 const COL_OFF := Color(0.55, 0.08, 0.12)
 const COL_TEXT := Color(1.0, 0.28, 0.75)       # bright pink, in the console's retro font
 const COL_TEXT_DIM := Color(0.85, 0.22, 0.62)
+const ANSWER_Z := LAYER_Z[3] - 1.5 * SPREAD      # where the answer's text stands, past the row
+const ANSWER_Y := GRID_Y + 40.0                 # bottom of that text
+const LABEL_MAX_WIDTH := 180.0                  # metres; longer labels wrap onto more lines
 const NETWORK_FONT_SCALE := 1.6                 # VT323 is small for its size; and a bit larger
 const COL_FRAME := Color(0.62, 0.22, 1.0)  # the input screen's neon border
 
@@ -82,6 +85,9 @@ var _input_tex: ImageTexture
 var _answer: Label3D
 var _answer_caption: Label3D
 var _center_note: Label3D
+var _titles := []   # each layer's title label
+var _notes := []    # each layer's note label above its title, or null
+var _facing := []   # labels turned towards the visitor's position (not their view) each frame
 var _sheet: MeshInstance3D
 var _digit_labels := []
 var _panel: Node3D
@@ -133,6 +139,19 @@ func _fixed_positions() -> PackedVector3Array:
 	return out
 
 
+## Turn labels to face where the visitor is, around the vertical axis only. (A billboard
+## follows the camera's rotation instead, so labels swing whenever you turn your head.)
+func _face_labels() -> void:
+	var cam := get_viewport().get_camera_3d()
+	if not cam:
+		return
+	var eye := cam.global_position
+	for l in _facing:
+		var d: Vector3 = eye - (l as Node3D).global_position
+		if d.x * d.x + d.z * d.z > 1e-6:
+			(l as Node3D).global_rotation = Vector3(0, atan2(d.x, d.z), 0)
+
+
 ## The console's retro terminal font (see main.gd), for the panel that travels with it.
 func _mono() -> Font:
 	return load("res://assets/fonts/VT323-Regular.ttf")
@@ -151,11 +170,13 @@ func _label(text: String, pos: Vector3, size := 40, color := COL_TEXT, billboard
 	l.font_size = int(size * NETWORK_FONT_SCALE)
 	l.pixel_size = LABEL_PIXEL
 	l.font = _mono()
+	l.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	l.width = LABEL_MAX_WIDTH / LABEL_PIXEL
 	l.outline_size = 0
 	l.modulate = color
 	l.position = pos
 	if billboard:
-		l.billboard = BaseMaterial3D.BILLBOARD_FIXED_Y
+		_facing.append(l)
 	add_child(l)
 	return l
 
@@ -316,27 +337,39 @@ void fragment() {
 		l.pixel_size = LABEL_PIXEL * 0.6
 		l.outline_size = 0
 		l.modulate = COL_TEXT_DIM
-		l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-		l.position = Vector3(0, BALL + CUBE * 0.4, 0)
+		_facing.append(l)
+		# Up and behind the ball, away from the cables arriving from the front.
+		l.position = Vector3(0, BALL + CUBE * 0.8, -BALL * 1.5)
 		node_inst[32 + d].add_child(l)
 		_digit_labels.append(l)
 
 
 func _build_labels() -> void:
 	var top := GRID_Y + GRID_SIZE / 2
-	var names := ["Your drawing · 28 × 28 = 784 pixel values (inputs, not neurons)",
+	var names := ["Your drawing
+28 × 28 = 784 pixel values
+(inputs, not neurons)",
 		"Hidden layer 1 · 16 neurons", "Hidden layer 2 · 16 neurons", "Answer · one neuron per digit"]
+	# Labels wrap at LABEL_MAX_WIDTH so that, seen from the side, neighbouring layers' labels
+	# keep apart. Each layer's title and note are stacked upwards by _stack_labels().
 	for l in 4:
-		var y := top + 3.0 * CUBE if l < 3 else GRID_Y + 3.0 * CUBE
-		_label(names[l], Vector3(0, y, LAYER_Z[l]), 44, COL_TEXT, true)
-	_label("Each neuron keeps its place, so you can follow it.
+		_titles.append(_label(names[l], Vector3(0, 0, LAYER_Z[l]), 44, COL_TEXT, true))
+		_notes.append(null)
+	_notes[1] = _label("Each neuron keeps its place, so you can follow it.
 Its place in the grid means nothing: every neuron is connected to every pixel.
 Line thickness compares weights within one layer, not between layers.",
-		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, COL_TEXT_DIM, true)
-	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, COL_TEXT_DIM, true)
+		Vector3(0, 0, LAYER_Z[1]), 30, COL_TEXT_DIM, true)
+	_center_note = _label("", Vector3(0, 0, LAYER_Z[0]), 30, COL_TEXT_DIM, true)
+	_notes[0] = _center_note
+	for l in 4:
+		_stack_labels(l)
 	set_center(false)
-	_answer = _label("", Vector3(0, GRID_Y + 0.5 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 200, COL_LIT, true)
-	_answer_caption = _label("", Vector3(0, GRID_Y - 0.4 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 40, COL_TEXT, true)
+	# The answer group stands past the answer row, clear of the cables: the "% sure" caption,
+	# the big digit above it, and the layer's title on top (see _stack_labels).
+	_answer = _label("", Vector3(0, ANSWER_Y + 30.0, ANSWER_Z), 200, COL_LIT, true)
+	_answer.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+	_answer_caption = _label("", Vector3(0, ANSWER_Y, ANSWER_Z), 40, COL_TEXT, true)
+	_answer_caption.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
 
 
 func _build_panel() -> void:
@@ -430,11 +463,30 @@ func input_hit(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 	return {"t": t, "uv": uv}
 
 
+## Stack a layer's title just above its top row of neurons, and its note (if any) above
+## the title, measuring the wrapped text so they never overlap.
+func _stack_labels(l: int) -> void:
+	var y: float = GRID_Y + GRID_SIZE / 2 + BALL + 8.0 if l < 3 else ANSWER_Y + 150.0
+	if l == 3:
+		_titles[l].position.z = ANSWER_Z
+	for lab in [_titles[l], _notes[l]]:
+		if lab == null:
+			continue
+		var label: Label3D = lab
+		label.vertical_alignment = VERTICAL_ALIGNMENT_BOTTOM
+		label.position.y = y
+		var size := _mono().get_multiline_string_size(label.text, HORIZONTAL_ALIGNMENT_CENTER,
+			label.width, label.font_size, -1, TextServer.BREAK_MANDATORY | TextServer.BREAK_WORD_BOUND)
+		y += size.y * label.pixel_size + 8.0
+
+
 func set_center(on: bool) -> void:
 	if _sheet:
 		_sheet.visible = on
 	_center_note.text = ("Helped: your drawing is resized and centred, like the digits it was trained on"
 		if on else "The network gets exactly what you draw, where you draw it")
+	if _titles.size() == 4:
+		_stack_labels(0)
 
 
 ## The selected-neuron panel stands to the left of the console. `station` is where the
@@ -456,6 +508,7 @@ func pulse_done() -> bool:
 
 
 func _process(delta: float) -> void:
+	_face_labels()
 	sway_t += delta
 	set_edge_param("sway_t", sway_t)
 	if pulse_t < 4.0:

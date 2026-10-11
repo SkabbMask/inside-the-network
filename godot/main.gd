@@ -19,7 +19,11 @@ const BAR_X0 := -1.3
 const BAR_X1 := -0.38
 const BAR_Y := 0.9
 const SPARK_H := 0.1
-const CONSOLE_DISTANCE := 1.6   # from the middle of the network, sideways, in grid widths
+# Where visitors start, in the network's own coordinates: out to the side, level with the
+# space between the hidden layers, looking across the network. The console waits in front.
+const START_POS := Vector3(768.8, 368.8, -482.2)
+const START_LOOK := Vector3(670.0, 372.8, -467.6)
+const EYE_HEIGHT := 1.6         # metres from the VR play-space floor to the eyes, roughly
 const VR_RENDER_SCALE := 0.75   # share of SteamVR's recommended resolution, per axis
 const FLY_SPEED := 40.0          # metres per second; hold Shift (or click the stick) for 4x
 # VR movement, tuned for comfort: no head-steered motion, snap turns, a vignette.
@@ -43,6 +47,8 @@ const CONSOLE_SCALE := 2.15
 const PANEL_CENTER := Vector2(-0.84, 1.17)   # middle of the buttons, pad and timeline
 # Where your head ends up relative to the console when you summon it (console space).
 const SUMMON_HEAD := Vector3(-0.84, 1.5, 0.6)
+# At the start it waits lower and further off, like a desk below your line of sight.
+const START_HEAD := Vector3(-0.84, 1.95, 1.0)
 
 # The console is a green-on-black terminal.
 const COL_BTN := Color(0.01, 0.05, 0.02)
@@ -115,6 +121,8 @@ var _snap_ready := true
 var _snap_flash := 0.0      # vignette flash after a snap turn, fades out
 var _edit_t := 0.0
 var _vignette: ShaderMaterial
+var _start_head := Vector3.ZERO   # where your eyes start
+var _start_basis := Basis()        # and which way you face (level)
 var _console_to := Transform3D()   # where the console is flying to after a summon
 var _console_moving := false
 var _summon_was_down := false
@@ -170,15 +178,19 @@ func _ready() -> void:
 
 	# The console stands side-on to the network, so you see every layer apart and the
 	# drawing (from behind) at the start of the stack.
-	var mid: Vector3 = view.to_global(Vector3(0, 0, NetworkView.MID_Z))
-	var spot: Vector3 = mid + view.global_basis.x * CONSOLE_DISTANCE * NetworkView.GRID_SIZE
-	_station = Transform3D(Basis.looking_at(mid - spot), spot)
+	var head: Vector3 = view.to_global(START_POS)
+	var ahead: Vector3 = view.to_global(START_LOOK) - head
+	ahead.y = 0.0
+	_start_basis = Basis.looking_at(ahead.normalized(), Vector3.UP)
+	_start_head = head
+	# The console's own frame: placed so the start position is where your head is at it.
+	_station = Transform3D(_start_basis, head - _start_basis * START_HEAD)
 	_console = Node3D.new()
 	add_child(_console)
 	_console.transform = _station
 	view.place_panel(_station)
 	_build_console_housing()
-	_floor.position = (mid + spot) / 2 - Vector3(0, 0.002, 0)
+	_floor.position = head - Vector3(0, EYE_HEIGHT + 0.002, 0)
 
 	pad = DrawPad.new()
 	_console.add_child(pad)
@@ -274,6 +286,16 @@ void fragment() {
 	var centre := Vector3(PANEL_CENTER.x, PANEL_CENTER.y, PANEL_Z - 0.02)
 	model.transform = Transform3D(basis, centre - basis * SCREEN_CENTER)
 	_console.add_child(model)
+
+
+## Where you are and where you look, in the network's own coordinates (for choosing the
+## starting position).
+func _print_camera() -> void:
+	var cam: Node3D = _xr_cam if vr else _cam
+	var p: Vector3 = view.to_local(cam.global_position)
+	var look: Vector3 = view.to_local(cam.global_position - cam.global_basis.z * 100.0)
+	print("Camera: position %s, looking at %s (network coordinates)" % [
+		p.snapped(Vector3.ONE * 0.1), look.snapped(Vector3.ONE * 0.1)])
 
 
 ## Bring the console to just in front of you, facing you (left controller B, desktop C).
@@ -496,7 +518,7 @@ func _setup_vr() -> void:
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	var origin := XROrigin3D.new()
 	add_child(origin)
-	origin.transform = _station
+	origin.transform = Transform3D(_start_basis, _start_head - Vector3(0, EYE_HEIGHT, 0))
 	_origin = origin
 	_xr_cam = XRCamera3D.new()
 	origin.add_child(_xr_cam)
@@ -689,7 +711,8 @@ func _setup_desktop() -> void:
 func _set_camera_view(n: int) -> void:
 	var mid: Vector3 = view.to_global(Vector3(0, NetworkView.GRID_Y, NetworkView.MID_Z))
 	if n == 1:
-		_cam.position = _station * Vector3(0.0, 1.9, 1.6)
+		_cam.position = _start_head
+		mid = view.to_global(START_LOOK)
 	elif n == 2:
 		_cam.position = _station * Vector3(0.0, NetworkView.GRID_SIZE * 0.4, NetworkView.GRID_SIZE * 0.6)
 	else:
@@ -701,6 +724,10 @@ func _set_camera_view(n: int) -> void:
 
 
 func _unhandled_input(event: InputEvent) -> void:
+	# P works in VR too (with the game window focused): print where you are.
+	if event is InputEventKey and event.pressed and not event.echo and event.keycode == KEY_P:
+		_print_camera()
+		return
 	if vr:
 		return
 	if event is InputEventMouseButton:

@@ -1,10 +1,12 @@
-## The board the visitor writes on. Keeps a 56x56 canvas of values 0..1.
+## The canvas the visitor draws on: the network's own 28x28 input pixels, values 0..1.
+## Shown on the console board and painted straight onto the input image in the scene.
 extends Node3D
 
 signal changed
 
-const RES := 56
-const BRUSH := 2.4  # radius in canvas pixels
+const RES := 28
+const BRUSH := 1.2  # radius of the solid core, in pixels
+const SOFT := 1.0   # width of the soft edge, in pixels (MNIST strokes have grey edges)
 
 var size := 0.45
 var canvas := PackedFloat32Array()
@@ -37,7 +39,7 @@ func build() -> void:
 	var m := StandardMaterial3D.new()
 	m.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
 	m.albedo_texture = _tex
-	m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_LINEAR
+	m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
 	board.material_override = m
 	add_child(board)
 
@@ -50,6 +52,11 @@ func build() -> void:
 	label.position = Vector3(0, size / 2 + 0.03, 0)
 	label.visible = false
 	add_child(label)
+
+
+## The canvas as a texture (dark 0.07 .. light 1.0), so other surfaces can show it too.
+func texture() -> ImageTexture:
+	return _tex
 
 
 ## Canvas coordinates (0..1) for a world point on the board plane, or (-1,-1) if outside.
@@ -109,7 +116,7 @@ func _stamp(uv: Vector2) -> void:
 			if x < 0 or x >= RES:
 				continue
 			var d := Vector2(x + 0.5, y + 0.5).distance_to(c)
-			var v := clampf((BRUSH + 0.8 - d) / 1.6, 0.0, 1.0)
+			var v := clampf((BRUSH + SOFT / 2 - d) / SOFT, 0.0, 1.0)
 			var i := y * RES + x
 			if v > canvas[i]:
 				canvas[i] = v

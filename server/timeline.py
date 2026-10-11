@@ -97,6 +97,16 @@ class Recording:
         scene can use one fixed scale per layer for the whole run."""
         return [float(max(np.sqrt((lay[l] ** 2).sum(1)).max() for lay in self.layouts)) for l in range(3)]
 
+    def weight_scale(self):
+        """One scale per layer for the whole run: the largest 99th-percentile weight size
+        the layer reaches. Dividing by it keeps line thickness comparable across time, so a
+        line only thickens when its weight really grows."""
+        if not hasattr(self, "_weight_scale"):
+            self._weight_scale = [
+                float(max(np.percentile(np.abs(W[l]), 99) for W, _ in self.weights)) + 1e-6
+                for l in range(3)]
+        return self._weight_scale
+
     def __len__(self):
         return len(self.steps)
 

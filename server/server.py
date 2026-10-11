@@ -8,6 +8,9 @@ Client -> server (JSON text):
   {"type": "hello"}                              timeline info, then the latest snapshot
   {"type": "seek", "index": k}                   show snapshot k
   {"type": "draw", "canvas": [n*n floats 0..1]}  run the network on a drawing
+  {"type": "center", "on": bool}                 help the model: resize and centre the
+                                                 drawing like the training digits (off by
+                                                 default: it gets exactly what was drawn)
   {"type": "clear"}
   {"type": "toggle_neuron", "layer": 1|2, "neuron": j}
   {"type": "neuron_weights", "layer": 1, "neuron": j}
@@ -16,7 +19,9 @@ Client -> server (JSON text):
 
 Server -> client:
   binary frames, little-endian: uint32 kind, then float32 payload
-    kind 1 = edges: EDGE_TEX_W * EDGE_TEX_H pairs (weight, flow), each in -1..1
+    kind 1 = edges: EDGE_TEX_W * EDGE_TEX_H pairs (weight, flow), each in -1..1;
+             weight on one fixed scale per layer for the whole run, flow scaled to the
+             strongest signal in its layer for the current drawing
     kind 2 = nodes: 784 input pixels, then 16 + 16 + 10 activations
     kind 3 = layout: (x, y) for the 16 + 16 + 10 neurons, in similarity units
   JSON: "timeline", "meta", "neuron_weights", "recording"
@@ -58,7 +63,17 @@ class State:
         self.rec = standard
         self.index = len(standard) - 1
         self.masks = [np.ones(16, np.float32), np.ones(16, np.float32)]
+        self.canvas = None
+        self.center = False
         self.x = np.zeros(784, np.float32)
+
+    def set_input(self):
+        if self.canvas is None:
+            self.x = np.zeros(784, np.float32)
+        elif self.center:
+            self.x = model.to_mnist(self.canvas)
+        else:
+            self.x = model.to_pixels(self.canvas)
 
     def net(self):
         W, b = self.rec.weights[self.index]
@@ -73,9 +88,10 @@ class State:
         W1, W2, W3 = net.W
         edges = np.zeros((EDGE_TEX_W * EDGE_TEX_H, 2), np.float32)
 
-        def put(offset, W, a_in):
+        scales = self.rec.weight_scale()
+
+        def put(offset, W, a_in, scale):
             n = W.size
-            scale = np.percentile(np.abs(W), 99) + 1e-6
             edges[offset:offset + n, 0] = np.clip(W / scale, -1, 1).reshape(-1)
             flow = W * a_in[None, :]
             m = np.abs(flow).max()
@@ -83,9 +99,9 @@ class State:
                 f = flow / m
                 edges[offset:offset + n, 1] = (np.sign(f) * np.sqrt(np.abs(f))).reshape(-1)
 
-        put(0, W1, x)
-        put(784 * 16, W2, h1)
-        put(784 * 16 + 256, W3, h2)
+        put(0, W1, x, scales[0])
+        put(784 * 16, W2, h1, scales[1])
+        put(784 * 16 + 256, W3, h2, scales[2])
         nodes = np.concatenate([x, h1, h2, out]).astype("<f4")
         layout = np.concatenate(self.rec.layouts[self.index]).astype("<f4")
         # Layout first: the scene starts a new blend when it arrives.
@@ -103,6 +119,7 @@ class State:
             "step": self.rec.steps[self.index],
             "accuracy": self.rec.accuracy[self.index],
             "drawn": drawn,
+            "center": self.center,
             "prediction": int(out.argmax()) if drawn else None,
             "probs": [round(float(p), 4) for p in out],
             "off": [[int(i) for i in np.where(m == 0)[0]] for m in self.masks],
@@ -140,10 +157,16 @@ def make_handler(data, standard):
                     st.index = int(np.clip(int(msg["index"]), 0, len(st.rec) - 1))
                     await send_state(ws, st)
                 elif t == "draw":
-                    st.x = model.to_mnist(msg["canvas"])
+                    st.canvas = msg["canvas"]
+                    st.set_input()
+                    await send_state(ws, st)
+                elif t == "center":
+                    st.center = bool(msg["on"])
+                    st.set_input()
                     await send_state(ws, st)
                 elif t == "clear":
-                    st.x = np.zeros(784, np.float32)
+                    st.canvas = None
+                    st.set_input()
                     await send_state(ws, st)
                 elif t == "toggle_neuron":
                     m = st.masks[int(msg["layer"]) - 1]

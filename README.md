@@ -9,11 +9,15 @@ about 13,000 weights), watch it learn, and draw digits for it to read.
 
 ## The space
 
-Depth is the order of computation: your drawing appears as a 28 × 28 mosaic on the
-floor, then hidden layer 1, hidden layer 2 and the ten answer neurons. Within each
-layer, neurons are placed on a similarity map: neurons that react to the same drawings
-sit close together (distance = 1 − correlation of their reactions on 1,000 test digits).
-The map is recomputed for every snapshot, so neurons move as training changes them.
+Depth is the order of computation, as a stack of upright slices about 4 m across: your
+drawing as 28 × 28 pixel values (inputs, not neurons), then hidden layers 1 and 2 as
+4 × 4 grids, then the ten answer neurons in a row from 0 to 9. Every neuron keeps its
+place for the whole run, so you can follow one through training; what changes is the
+connections. A hidden neuron's place in its grid has no meaning: each one is connected
+to every pixel, and its weight image (select it) covers almost the whole digit.
+
+(The server still computes a similarity-map layout per snapshot. An earlier version
+placed neurons by it; the scene no longer uses it.)
 
 Connections: thickness = size of the weight, colour = sign (orange pushes the next
 neuron on, blue pushes it off). Brightness is the pulse: when you finish a stroke, your
@@ -30,11 +34,12 @@ signal it carries. While the timeline plays, the pulse repeats like a heartbeat.
 
 | | |
 |---|---|
-| Draw on the board, press buttons, select a neuron, drag the timeline | Left mouse |
+| Draw (on the input image or the console board), press buttons, select a neuron, drag the timeline | Left mouse |
 | Switch a hidden neuron off / on | Right mouse on it |
 | Play / pause | Space |
-| Camera: at the console / side-on to the network | 1 / 2 |
-| Look / move | Middle-drag / WASD, Q, E |
+| Camera: at the console / further back, overview / in front of the input, to draw | 1 / 2 / 3 |
+| Look (turn / tilt) | Arrow keys, or middle-drag |
+| Fly / up, down / faster | WASD / U, J / hold Shift |
 
 Timeline: Start, Reverse, Play, Slower, Faster, End, or drag along the curve.
 The curve is the share of test digits answered correctly. Time runs by snapshot, so the

@@ -63,6 +63,20 @@ def _resize(img, h, w):
     return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
 
 
+def to_pixels(canvas):
+    """A drawing (any square size, values 0..1) at 28x28, exactly where and as large as it
+    was drawn: only the resolution changes."""
+    img = np.asarray(canvas, np.float32)
+    n = int(round(np.sqrt(img.size)))
+    img = img.reshape(n, n)
+    if n % 28 == 0:
+        k = n // 28
+        out = img.reshape(28, k, 28, k).mean((1, 3))
+    else:
+        out = _resize(img, 28, 28)
+    return np.clip(out, 0, 1).reshape(784)
+
+
 def to_mnist(canvas):
     """Turn a drawing (any square size, values 0..1) into what MNIST digits look like:
     the digit fitted into a 20x20 box and centred by mass in a 28x28 frame."""

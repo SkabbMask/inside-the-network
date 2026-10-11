@@ -13,13 +13,25 @@ const N_NODES := 826
 const EDGE_TEX_W := 128
 const EDGE_TEX_H := 102
 
-const FLOOR_CENTER := Vector3(0, 0.01, -1.35)
-const FLOOR_SIZE := 1.6
-const LAYER_Z := [0.0, -3.6, -6.2, -8.8]
-const LAYER_Y := 1.9
-const LAYER_RADIUS := 1.5   # the farthest a neuron gets from its layer's centre, in metres
-const NODE_RADIUS := 0.055
-const PICK_RADIUS := 0.09
+# The whole network is built large, so you fly between neurons and the lines (which keep
+# their real thickness in millimetres) have room to stay apart. Distances scale with SPREAD.
+const SPREAD := 10.0
+const LAYER_Z := [0.0, -3.6 * SPREAD, -6.2 * SPREAD, -8.8 * SPREAD]
+const MID_Z := -4.4 * SPREAD
+# Every slice (the input image and both hidden grids) is a square this wide, in metres,
+# standing upright, with its lowest neurons GRID_FLOOR above the floor.
+const GRID_SIZE := 4.0 * SPREAD
+const GRID_FLOOR := 2.0
+const GRID_Y := GRID_FLOOR + GRID_SIZE / 2
+const ANSWER_WIDTH := 6.5 * SPREAD
+const LABEL_PIXEL := 0.0035 * SPREAD   # text size in the network, metres per font pixel
+# Every neuron is a cube. Its front face (towards the previous layer) is a small copy of
+# that layer: a 28 x 28 grid for the pixels, or the 4 x 4 seats of the hidden grid. Each
+# incoming line ends at its own point there; the one outgoing value leaves from the
+# middle of the back face.
+const CUBE := 2.0
+const FACE_FILL := 0.9   # share of the face the connection points cover
+const PICK_RADIUS := CUBE * 0.8
 
 const COL_POS := Color(1.0, 0.55, 0.18)
 const COL_NEG := Color(0.25, 0.6, 1.0)
@@ -34,7 +46,6 @@ var pos_to := PackedVector3Array()
 var pos_now := PackedVector3Array()
 var blend := 1.0
 var blend_time := 0.15
-var layer_scale := [0.0, 2.5, 2.5, 2.5]   # set per run from the server's extents
 var pulse_t := 10.0
 var pulse_speed := 1.6   # layers per second
 
@@ -45,6 +56,7 @@ var off := [[], [], [], []]
 var selected := Vector2i(-1, -1)
 
 var edge_mat: ShaderMaterial
+var _edge_faded_mat: ShaderMaterial
 var _edge_tex := []   # two ImageTextures, alternating
 var _pos_tex := []
 var _cur := 0         # which of the two holds the newest data
@@ -53,8 +65,9 @@ var _input_img: Image
 var _input_tex: ImageTexture
 var _answer: Label3D
 var _answer_caption: Label3D
+var _center_note: Label3D
+var _sheet: MeshInstance3D
 var _digit_labels := []
-var _layer_labels := []
 var _panel: Node3D
 var _panel_img: Image
 var _panel_tex: ImageTexture
@@ -67,21 +80,17 @@ func build() -> void:
 	for i in 784:
 		var r := i / 28
 		var c := i % 28
-		var x := (c + 0.5) / 28.0 * FLOOR_SIZE - FLOOR_SIZE / 2
-		var z := FLOOR_CENTER.z - FLOOR_SIZE / 2 + (r + 0.5) / 28.0 * FLOOR_SIZE
-		input_pos.append(Vector3(x, FLOOR_CENTER.y, z))
-	# Before the first layout arrives, put each layer on a small circle.
-	for l in range(1, 4):
-		for i in SIZES[l]:
-			var a: float = TAU * float(i) / float(SIZES[l])
-			var p := Vector3(cos(a) * 0.3, LAYER_Y + sin(a) * 0.3, LAYER_Z[l])
-			pos_from.append(p)
-			pos_to.append(p)
-			pos_now.append(p)
+		var x := (c + 0.5) / 28.0 * GRID_SIZE - GRID_SIZE / 2
+		var y := GRID_Y + GRID_SIZE / 2 - (r + 0.5) / 28.0 * GRID_SIZE
+		input_pos.append(Vector3(x, y, LAYER_Z[0]))
+	var fixed := _fixed_positions()
+	pos_from = fixed.duplicate()
+	pos_to = fixed.duplicate()
+	pos_now = fixed.duplicate()
 	acts.resize(N_NODES)
 	acts.fill(0.0)
 	_pos_img = Image.create(N_NODES, 1, false, Image.FORMAT_RGBF)
-	_build_floor()
+	_build_input()
 	_build_edges()
 	_build_nodes()
 	_build_labels()
@@ -92,6 +101,21 @@ func build() -> void:
 
 
 # ------------------------------------------------------------------ construction
+
+## Every neuron keeps one place for the whole run, so you can follow it through training.
+## Hidden layers are 4 × 4 grids filling the same square as the image; a neuron's place
+## in the grid means nothing (each one is connected to every pixel). Answers: a row, 0 to 9.
+func _fixed_positions() -> PackedVector3Array:
+	var out := PackedVector3Array()
+	for l in range(1, 3):
+		for i in 16:
+			var x := (i % 4) / 3.0 * GRID_SIZE - GRID_SIZE / 2
+			var y := GRID_Y + GRID_SIZE / 2 - (i / 4) / 3.0 * GRID_SIZE
+			out.append(Vector3(x, y, LAYER_Z[l]))
+	for d in 10:
+		out.append(Vector3(d / 9.0 * ANSWER_WIDTH - ANSWER_WIDTH / 2, GRID_Y, LAYER_Z[3]))
+	return out
+
 
 func _unshaded(color: Color) -> StandardMaterial3D:
 	var m := StandardMaterial3D.new()
@@ -104,7 +128,7 @@ func _label(text: String, pos: Vector3, size := 40, color := COL_TEXT, billboard
 	var l := Label3D.new()
 	l.text = text
 	l.font_size = size
-	l.pixel_size = 0.0035
+	l.pixel_size = LABEL_PIXEL
 	l.outline_size = 0
 	l.modulate = color
 	l.position = pos
@@ -114,28 +138,29 @@ func _label(text: String, pos: Vector3, size := 40, color := COL_TEXT, billboard
 	return l
 
 
-func _build_floor() -> void:
+## The input: your drawing as 28 × 28 pixel values, standing upright as the first slice.
+func _build_input() -> void:
 	_input_img = Image.create(28, 28, false, Image.FORMAT_L8)
 	_input_tex = ImageTexture.create_from_image(_input_img)
+	var center := Vector3(0, GRID_Y, LAYER_Z[0])
 	var border := MeshInstance3D.new()
-	var bp := PlaneMesh.new()
-	bp.size = Vector2(FLOOR_SIZE + 0.06, FLOOR_SIZE + 0.06)
-	border.mesh = bp
+	var bq := QuadMesh.new()
+	bq.size = Vector2(GRID_SIZE + 0.1, GRID_SIZE + 0.1)
+	border.mesh = bq
 	border.material_override = _unshaded(Color(0.22, 0.24, 0.3))
-	border.position = FLOOR_CENTER - Vector3(0, 0.004, 0)
+	border.position = center - Vector3(0, 0, 0.01)
 	add_child(border)
 	var tiles := MeshInstance3D.new()
-	var p := PlaneMesh.new()
-	p.size = Vector2(FLOOR_SIZE, FLOOR_SIZE)
-	tiles.mesh = p
+	var q := QuadMesh.new()
+	q.size = Vector2(GRID_SIZE, GRID_SIZE)
+	tiles.mesh = q
 	var m := _unshaded(Color.WHITE)
 	m.albedo_texture = _input_tex
 	m.texture_filter = BaseMaterial3D.TEXTURE_FILTER_NEAREST
+	m.cull_mode = BaseMaterial3D.CULL_DISABLED
 	tiles.material_override = m
-	tiles.position = FLOOR_CENTER
+	tiles.position = center
 	add_child(tiles)
-	var l := _label("What the network sees: 28 × 28 = 784 pixels", FLOOR_CENTER + Vector3(0, 0.005, FLOOR_SIZE / 2 + 0.1), 40)
-	l.rotation.x = -PI / 2
 
 
 func _build_edges() -> void:
@@ -157,38 +182,63 @@ func _build_edges() -> void:
 	inst.multimesh = mm
 	inst.cast_shadow = GeometryInstance3D.SHADOW_CASTING_SETTING_OFF
 	# The shader moves every vertex, so tell the engine where the edges can be.
-	inst.custom_aabb = AABB(Vector3(-3, -1, -11), Vector3(6, 7, 12))
+	inst.custom_aabb = AABB(Vector3(-ANSWER_WIDTH / 2 - CUBE, -1, LAYER_Z[3] - CUBE),
+		Vector3(ANSWER_WIDTH + 2 * CUBE, GRID_Y + GRID_SIZE / 2 + CUBE + 1, -LAYER_Z[3] + 2 * CUBE))
 	edge_mat = ShaderMaterial.new()
 	edge_mat.shader = load("res://edge.gdshader")
+	# A second pass draws the lines not touching a selected neuron, see-through.
+	_edge_faded_mat = ShaderMaterial.new()
+	_edge_faded_mat.shader = load("res://edge_faded.gdshader")
+	edge_mat.next_pass = _edge_faded_mat
 	for k in 2:
 		_edge_tex.append(ImageTexture.create_from_image(Image.create(EDGE_TEX_W, EDGE_TEX_H, false, Image.FORMAT_RGF)))
 		_pos_tex.append(ImageTexture.create_from_image(_pos_img))
-	edge_mat.set_shader_parameter("tex_w", EDGE_TEX_W)
-	edge_mat.set_shader_parameter("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
-	edge_mat.set_shader_parameter("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
+	set_edge_param("tex_w", EDGE_TEX_W)
+	set_edge_param("cube", CUBE)
+	set_edge_param("face_fill", FACE_FILL)
+	set_edge_param("pos_col", Vector3(COL_POS.r, COL_POS.g, COL_POS.b))
+	set_edge_param("neg_col", Vector3(COL_NEG.r, COL_NEG.g, COL_NEG.b))
 	_bind_textures()
 	inst.material_override = edge_mat
 	add_child(inst)
 
 
+## Edge settings go to both passes.
+func set_edge_param(name: String, value) -> void:
+	edge_mat.set_shader_parameter(name, value)
+	_edge_faded_mat.set_shader_parameter(name, value)
+
+
 func _bind_textures() -> void:
 	var prev := 1 - _cur
-	edge_mat.set_shader_parameter("edge_a", _edge_tex[prev])
-	edge_mat.set_shader_parameter("edge_b", _edge_tex[_cur])
-	edge_mat.set_shader_parameter("pos_a", _pos_tex[prev])
-	edge_mat.set_shader_parameter("pos_b", _pos_tex[_cur])
+	set_edge_param("edge_a", _edge_tex[prev])
+	set_edge_param("edge_b", _edge_tex[_cur])
+	set_edge_param("pos_a", _pos_tex[prev])
+	set_edge_param("pos_b", _pos_tex[_cur])
 
 
 func _build_nodes() -> void:
-	var sphere := SphereMesh.new()
-	sphere.radius = NODE_RADIUS
-	sphere.height = NODE_RADIUS * 2
-	sphere.radial_segments = 16
-	sphere.rings = 8
+	var box := BoxMesh.new()
+	box.size = Vector3.ONE * CUBE
+	# Unshaded, but side faces a little darker so the cubes read as solid.
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+render_mode unshaded;
+uniform vec3 col = vec3(0.16, 0.17, 0.21);
+varying float v_shade;
+void vertex() {
+	v_shade = 0.7 + 0.3 * abs(NORMAL.z) + 0.1 * NORMAL.y;
+}
+void fragment() {
+	ALBEDO = col * v_shade;
+}
+"""
 	for k in 42:
 		var mi := MeshInstance3D.new()
-		mi.mesh = sphere
-		var m := _unshaded(COL_IDLE)
+		mi.mesh = box
+		var m := ShaderMaterial.new()
+		m.shader = sh
 		mi.material_override = m
 		mi.position = pos_now[k]
 		add_child(mi)
@@ -198,31 +248,35 @@ func _build_nodes() -> void:
 		var l := Label3D.new()
 		l.text = str(d)
 		l.font_size = 64
-		l.pixel_size = 0.002
+		l.pixel_size = LABEL_PIXEL * 0.6
 		l.outline_size = 0
 		l.modulate = Color(0.5, 0.54, 0.6)
 		l.billboard = BaseMaterial3D.BILLBOARD_ENABLED
-		l.position = Vector3(0.09, 0, 0)
+		l.position = Vector3(0, CUBE / 2 + CUBE * 0.4, 0)
 		node_inst[32 + d].add_child(l)
 		_digit_labels.append(l)
 
 
 func _build_labels() -> void:
-	var names := ["", "Hidden layer 1 · 16 neurons", "Hidden layer 2 · 16 neurons", "Answer · one neuron per digit"]
-	for l in range(1, 4):
-		_layer_labels.append(_label(names[l], Vector3(0, LAYER_Y + LAYER_RADIUS + 0.3, LAYER_Z[l]), 44, COL_TEXT, true))
-	_label("Within a layer, neurons that react to the same drawings sit close together.",
-		Vector3(0, LAYER_Y + LAYER_RADIUS + 0.6, LAYER_Z[1]), 30, Color(0.6, 0.64, 0.72), true)
-	_answer = _label("", Vector3(0, LAYER_Y + 0.2, LAYER_Z[3] - 1.2), 200, COL_LIT, true)
-	_answer_caption = _label("", Vector3(0, LAYER_Y - 0.35, LAYER_Z[3] - 1.2), 40, COL_TEXT, true)
+	var top := GRID_Y + GRID_SIZE / 2
+	var names := ["Your drawing · 28 × 28 = 784 pixel values (inputs, not neurons)",
+		"Hidden layer 1 · 16 neurons", "Hidden layer 2 · 16 neurons", "Answer · one neuron per digit"]
+	for l in 4:
+		var y := top + 3.0 * CUBE if l < 3 else GRID_Y + 3.0 * CUBE
+		_label(names[l], Vector3(0, y, LAYER_Z[l]), 44, COL_TEXT, true)
+	_label("Each neuron keeps its place, so you can follow it. Its place in the grid means nothing: every neuron is connected to every pixel.",
+		Vector3(0, top + 5.0 * CUBE, LAYER_Z[1]), 30, Color(0.6, 0.64, 0.72), true)
+	_center_note = _label("", Vector3(0, top + 5.0 * CUBE, LAYER_Z[0]), 30, Color(0.6, 0.64, 0.72), true)
+	set_center(false)
+	_answer = _label("", Vector3(0, GRID_Y + 0.5 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 200, COL_LIT, true)
+	_answer_caption = _label("", Vector3(0, GRID_Y - 0.4 * SPREAD, LAYER_Z[3] - 1.5 * SPREAD), 40, COL_TEXT, true)
 
 
 func _build_panel() -> void:
 	_panel = Node3D.new()
 	_panel.top_level = true
 	add_child(_panel)
-	_panel.global_position = Vector3(-1.75, 1.35, -0.75)
-	_panel.look_at(Vector3(0, 1.4, 0.6), Vector3.UP, true)
+	place_panel(Transform3D.IDENTITY)
 	_panel_img = Image.create(28, 28, false, Image.FORMAT_RGB8)
 	_panel_tex = ImageTexture.create_from_image(_panel_img)
 	_panel_quad = MeshInstance3D.new()
@@ -252,12 +306,75 @@ func _build_panel() -> void:
 	_panel.visible = false
 
 
+## Your drawing as faint chalk on a sheet just in front of the input slice, shown only
+## while the model is being helped, when the slice shows the centred version instead.
+func add_drawing_sheet(canvas: Texture2D) -> void:
+	var sh := Shader.new()
+	sh.code = """
+shader_type spatial;
+render_mode unshaded, cull_disabled, depth_draw_never, blend_mix;
+uniform sampler2D canvas : filter_linear;
+void fragment() {
+	float v = clamp((texture(canvas, UV).r - 0.07) / 0.93, 0.0, 1.0);
+	ALBEDO = vec3(1.0, 0.93, 0.78);
+	ALPHA = v * 0.45;
+}
+"""
+	var m := ShaderMaterial.new()
+	m.shader = sh
+	m.set_shader_parameter("canvas", canvas)
+	var sheet := MeshInstance3D.new()
+	var q := QuadMesh.new()
+	q.size = Vector2(GRID_SIZE, GRID_SIZE)
+	sheet.mesh = q
+	sheet.material_override = m
+	sheet.position = Vector3(0, GRID_Y, LAYER_Z[0] + 0.05)
+	sheet.visible = false
+	add_child(sheet)
+	_sheet = sheet
+
+
+## Paint the input slice straight from the drawing, without waiting for the server.
+func show_input(values: PackedFloat32Array) -> void:
+	var bytes := PackedByteArray()
+	bytes.resize(784)
+	for i in 784:
+		bytes[i] = int(18 + clampf(values[i], 0.0, 1.0) * 237.0)
+	_input_img.set_data(28, 28, false, Image.FORMAT_L8, bytes)
+	_input_tex.update(_input_img)
+
+
+## Where a ray hits the input slice: {t, uv} with uv in 0..1 (top left = 0, 0), or {}.
+func input_hit(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
+	var o := to_local(world_origin)
+	var d := (global_basis.inverse() * world_dir).normalized()
+	if absf(d.z) < 1e-5:
+		return {}
+	var t := (LAYER_Z[0] - o.z) / d.z
+	if t <= 0.0:
+		return {}
+	var p := o + d * t
+	var uv := Vector2(p.x / GRID_SIZE + 0.5, 0.5 - (p.y - GRID_Y) / GRID_SIZE)
+	if uv.x < 0.0 or uv.x > 1.0 or uv.y < 0.0 or uv.y > 1.0:
+		return {}
+	return {"t": t, "uv": uv}
+
+
+func set_center(on: bool) -> void:
+	if _sheet:
+		_sheet.visible = on
+	_center_note.text = ("Helped: your drawing is resized and centred, like the digits it was trained on"
+		if on else "The network gets exactly what you draw, where you draw it")
+
+
+## The selected-neuron panel stands to the left of the console. `station` is where the
+## visitor stands at the console, facing the network.
+func place_panel(station: Transform3D) -> void:
+	var local := Transform3D(Basis(), Vector3(-1.75, 1.35, -0.75)).looking_at(Vector3(0, 1.4, 0.6), Vector3.UP, true)
+	_panel.global_transform = station * local
+
+
 # ------------------------------------------------------------------ updates
-
-func set_extent(extent: Array) -> void:
-	for l in 3:
-		layer_scale[l + 1] = LAYER_RADIUS / maxf(float(extent[l]), 0.05)
-
 
 ## Send the current drawing through the network as a visible pulse.
 func pulse() -> void:
@@ -271,11 +388,11 @@ func pulse_done() -> bool:
 func _process(delta: float) -> void:
 	if pulse_t < 4.0:
 		pulse_t += delta * pulse_speed
-		edge_mat.set_shader_parameter("pulse_t", pulse_t)
+		set_edge_param("pulse_t", pulse_t)
 		_recolor()
 	if blend < 1.0:
 		blend = minf(1.0, blend + delta / blend_time)
-		edge_mat.set_shader_parameter("blend", blend)
+		set_edge_param("blend", blend)
 		for k in 42:
 			pos_now[k] = pos_from[k].lerp(pos_to[k], blend)
 			node_inst[k].position = pos_now[k]
@@ -293,25 +410,19 @@ func _write_positions(hidden: PackedVector3Array) -> void:
 
 
 ## A snapshot is three frames (layout, edges, nodes). The layout frame starts a new
-## blend; edges and nodes write into the same "current" slot.
+## blend; edges and nodes write into the same "current" slot. Neurons have fixed places,
+## so the server's similarity-map layout itself is not used.
 func apply_layout(payload: PackedByteArray) -> void:
-	var f := payload.to_float32_array()
-	if f.size() != 84:
+	if payload.to_float32_array().size() != 84:
 		return
-	var target := PackedVector3Array()
-	var k := 0
-	for l in range(1, 4):
-		var s: float = layer_scale[l]
-		for i in SIZES[l]:
-			target.append(Vector3(f[k * 2] * s, LAYER_Y + f[k * 2 + 1] * s, LAYER_Z[l]))
-			k += 1
+	var target := _fixed_positions()
 	pos_from = pos_now.duplicate()
 	pos_to = target
 	# The newest data moves to the other slot; the edges frame that follows fills it.
 	_write_positions(target)
 	_bind_textures()
 	blend = 0.0
-	edge_mat.set_shader_parameter("blend", 0.0)
+	set_edge_param("blend", 0.0)
 
 
 func apply_edges(payload: PackedByteArray) -> void:
@@ -324,12 +435,7 @@ func apply_nodes(payload: PackedByteArray) -> void:
 	var f := payload.to_float32_array()
 	if f.size() != N_NODES:
 		return
-	var bytes := PackedByteArray()
-	bytes.resize(784)
-	for i in 784:
-		bytes[i] = int(18 + clampf(f[i], 0.0, 1.0) * 237.0)
-	_input_img.set_data(28, 28, false, Image.FORMAT_L8, bytes)
-	_input_tex.update(_input_img)
+	show_input(f.slice(0, 784))
 	for i in N_NODES:
 		acts[i] = f[i]
 	_recolor()
@@ -363,18 +469,18 @@ func _layer_of(k: int) -> Vector2i:
 func _recolor() -> void:
 	for k in 42:
 		var ln := _layer_of(k)
-		var m: StandardMaterial3D = node_mats[k]
+		var m: ShaderMaterial = node_mats[k]
 		if off[ln.x].has(ln.y):
-			m.albedo_color = COL_OFF
+			m.set_shader_parameter("col", COL_OFF)
 		else:
 			# A neuron lights up when the pulse reaches its layer.
 			var arrived := smoothstep(float(ln.x) - 0.2, float(ln.x), pulse_t)
-			m.albedo_color = COL_IDLE.lerp(COL_LIT, clampf(acts[784 + k], 0.0, 1.0) * arrived)
-		node_inst[k].scale = Vector3.ONE * (1.7 if selected == ln else 1.0)
+			m.set_shader_parameter("col", COL_IDLE.lerp(COL_LIT, clampf(acts[784 + k], 0.0, 1.0) * arrived))
+		node_inst[k].scale = Vector3.ONE * (1.2 if selected == ln else 1.0)
 
 
 func set_mode(flow: bool) -> void:
-	edge_mat.set_shader_parameter("mode", 0 if flow else 1)
+	set_edge_param("mode", 0 if flow else 1)
 
 
 # ------------------------------------------------------------------ picking and selection
@@ -405,10 +511,10 @@ func select(layer: int, neuron: int) -> void:
 		neuron = -1
 	selected = Vector2i(layer, neuron)
 	if layer < 0:
-		edge_mat.set_shader_parameter("focus_node", -1.0)
+		set_edge_param("focus_node", -1.0)
 		_panel.visible = false
 	else:
-		edge_mat.set_shader_parameter("focus_node", float(NODE_OFFSET[layer] + neuron))
+		set_edge_param("focus_node", float(NODE_OFFSET[layer] + neuron))
 		_panel.visible = true
 		var names := ["", "Hidden layer 1", "Hidden layer 2", "Answer"]
 		_panel_title.text = "%s · neuron %d" % [names[layer], neuron + 1] if layer < 3 else "Answer neuron for %d" % neuron

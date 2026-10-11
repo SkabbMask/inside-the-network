@@ -19,6 +19,8 @@ const BAR_X0 := -1.3
 const BAR_X1 := -0.38
 const BAR_Y := 0.9
 const SPARK_H := 0.1
+const CONSOLE_DISTANCE := 1.6   # from the middle of the network, sideways, in grid widths
+const FLY_SPEED := 8.0          # metres per second; hold Shift for 4x
 
 const COL_BTN := Color(0.17, 0.19, 0.24)
 const COL_BTN_HOVER := Color(0.3, 0.33, 0.4)
@@ -29,12 +31,17 @@ var screenshot_path := ""
 var screenshot_at := -1
 var screenshot_pulse := -1.0
 var screenshot_view := 1
+var screenshot_center := false
+var screenshot_cam = null    # Vector3 in network coordinates, or null for a preset view
+var screenshot_look = null
+var screenshot_select := Vector2i(-1, -1)
 
 var client
 var view
 var pad
 var vr := false
 var flow_mode := true
+var center := false   # help the model by resizing and centring the drawing
 var connected := false
 var recording := false
 var _last_send := 0.0
@@ -56,7 +63,10 @@ var _in_flight_since := 0.0
 var _jump_on_meta := false
 var _pulse_on_meta := true
 var _drawn := false
+var _console: Node3D       # parent of the board, buttons and timeline
+var _station: Transform3D  # where the visitor stands at the console, facing the network
 var _spark: MeshInstance3D
+var _floor: MeshInstance3D
 var _playhead_mark: MeshInstance3D
 
 # desktop camera
@@ -79,21 +89,40 @@ func _ready() -> void:
 			screenshot_view = int(a.trim_prefix("--view="))
 		elif a.begins_with("--at="):
 			screenshot_at = int(a.trim_prefix("--at="))
+		elif a.begins_with("--cam="):
+			screenshot_cam = _vec3_arg(a.trim_prefix("--cam="))
+		elif a.begins_with("--look="):
+			screenshot_look = _vec3_arg(a.trim_prefix("--look="))
+		elif a.begins_with("--select="):
+			var p := a.trim_prefix("--select=").split(",")
+			screenshot_select = Vector2i(int(p[0]), int(p[1]))
+		elif a.begins_with("--center="):
+			screenshot_center = a.trim_prefix("--center=") == "1"
 
 	_build_world()
 	view = NetworkView.new()
 	add_child(view)
-	# The network runs diagonally away to the front right, so you see both its depth
-	# and the face of each layer from where you start.
-	view.rotation.y = deg_to_rad(-60)
-	view.position = Vector3(-0.8, 0, -1.9)
 	view.build()
 
+	# The console stands side-on to the network, so you see every layer apart and the
+	# drawing (from behind) at the start of the stack.
+	var mid: Vector3 = view.to_global(Vector3(0, 0, NetworkView.MID_Z))
+	var spot: Vector3 = mid + view.global_basis.x * CONSOLE_DISTANCE * NetworkView.GRID_SIZE
+	_station = Transform3D(Basis.looking_at(mid - spot), spot)
+	_console = Node3D.new()
+	add_child(_console)
+	_console.transform = _station
+	view.place_panel(_station)
+	_floor.position = (mid + spot) / 2 - Vector3(0, 0.002, 0)
+
 	pad = DrawPad.new()
-	add_child(pad)
+	_console.add_child(pad)
 	pad.size = 0.36
 	pad.position = Vector3(-1.0, 1.32, PANEL_Z)
 	pad.build()
+	view.add_drawing_sheet(pad.texture())
+	# Without help, the network gets exactly the drawing: show it on the slice at once.
+	pad.changed.connect(func(): if not center: view.show_input(pad.canvas))
 
 	_build_buttons()
 	_build_timeline()
@@ -126,7 +155,7 @@ func _make_label(text: String, pos: Vector3, size := 30, color := COL_TEXT) -> L
 	l.outline_size = 0
 	l.modulate = color
 	l.position = pos
-	add_child(l)
+	_console.add_child(l)
 	return l
 
 
@@ -144,7 +173,7 @@ func _box(size: Vector3, pos: Vector3, color: Color) -> MeshInstance3D:
 	mi.mesh = b
 	mi.material_override = _flat(color)
 	mi.position = pos
-	add_child(mi)
+	_console.add_child(mi)
 	return mi
 
 
@@ -160,13 +189,13 @@ func _build_world() -> void:
 	var we := WorldEnvironment.new()
 	we.environment = env
 	add_child(we)
-	var floor_mi := MeshInstance3D.new()
+	_floor = MeshInstance3D.new()
 	var plane := PlaneMesh.new()
-	plane.size = Vector2(16, 16)
-	floor_mi.mesh = plane
-	floor_mi.material_override = _flat(Color(0.055, 0.06, 0.075))
-	floor_mi.position.y = -0.002
-	add_child(floor_mi)
+	plane.size = Vector2(400, 400)
+	_floor.mesh = plane
+	_floor.material_override = _flat(Color(0.055, 0.06, 0.075))
+	_floor.position.y = -0.002
+	add_child(_floor)
 
 
 func _add_button(id: String, text: String, center: Vector2, size: Vector2) -> void:
@@ -181,6 +210,7 @@ func _build_buttons() -> void:
 		["view", "Show all weights"],
 		["train", "Train from scratch"],
 		["reset", "Standard run"],
+		["center", "Help: centre it"],
 	]
 	var y := 1.47
 	for d in defs:
@@ -194,7 +224,7 @@ func _build_timeline() -> void:
 	_playhead_mark = _box(Vector3(0.006, SPARK_H + 0.04, 0.012), Vector3(BAR_X0, BAR_Y + SPARK_H / 2, PANEL_Z), Color(1.0, 0.85, 0.5))
 	_spark = MeshInstance3D.new()
 	_spark.material_override = _flat(Color(0.55, 0.85, 0.65))
-	add_child(_spark)
+	_console.add_child(_spark)
 	_time_label = _make_label("", Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y + SPARK_H + 0.04, PANEL_Z), 24)
 	_make_label("Correct answers on test digits, through training", Vector3((BAR_X0 + BAR_X1) / 2, BAR_Y - 0.035, PANEL_Z), 20, Color(0.6, 0.64, 0.7))
 	var ids := [["start", "Start"], ["reverse", "Reverse"], ["play", "Play"], ["slower", "Slower"], ["faster", "Faster"], ["end", "End"]]
@@ -228,6 +258,9 @@ func _press_button(id: String) -> void:
 			client.send({"type": "retrain"})
 		"reset":
 			client.send({"type": "reset"})
+		"center":
+			client.send({"type": "center", "on": not center})
+			_pulse_on_meta = true
 		"play":
 			if not playing and _at_end():
 				playhead = 0.0 if direction > 0 else float(steps.size() - 1)
@@ -271,6 +304,7 @@ func _setup_vr() -> void:
 	DisplayServer.window_set_vsync_mode(DisplayServer.VSYNC_DISABLED)
 	var origin := XROrigin3D.new()
 	add_child(origin)
+	origin.transform = _station
 	origin.add_child(XRCamera3D.new())
 	for hand in ["left_hand", "right_hand"]:
 		var ctrl := XRController3D.new()
@@ -304,16 +338,18 @@ func _setup_desktop() -> void:
 
 
 ## Desktop camera presets: 1 = at the console (where a VR visitor starts),
-## 2 = side-on to the network, to see all layers apart.
+## 2 = further back and higher, to see the console and the whole network,
+## 3 = in front of the input slice, to draw on it.
 func _set_camera_view(n: int) -> void:
+	var mid: Vector3 = view.to_global(Vector3(0, NetworkView.GRID_Y, NetworkView.MID_Z))
 	if n == 1:
-		_cam.position = Vector3(0.0, 2.0, 2.4)
-		_cam.look_at(Vector3(2.8, 1.5, -4.6))
+		_cam.position = _station * Vector3(0.0, 1.9, 1.6)
+	elif n == 2:
+		_cam.position = _station * Vector3(0.0, 25.0, 40.0)
 	else:
-		var mid: Vector3 = view.to_global(Vector3(0, 1.9, -6.2))
-		var side: Vector3 = view.global_basis * Vector3(1, 0, 0)
-		_cam.position = mid + side * 8.0 + Vector3(0, 0.6, 0)
-		_cam.look_at(mid)
+		_cam.position = view.to_global(Vector3(0.0, NetworkView.GRID_Y, NetworkView.GRID_SIZE * 1.1))
+		mid = view.to_global(Vector3(0, NetworkView.GRID_Y, 0))
+	_cam.look_at(mid)
 	_yaw = _cam.rotation.y
 	_pitch = _cam.rotation.x
 
@@ -338,19 +374,35 @@ func _unhandled_input(event: InputEvent) -> void:
 				_set_camera_view(1)
 			KEY_2:
 				_set_camera_view(2)
+			KEY_3:
+				_set_camera_view(3)
 
 
 func _process(delta: float) -> void:
 	if not vr and _cam:
+		# Arrows turn (left/right) and tilt (up/down) the camera in place.
+		var turn := 0.0
+		var tilt := 0.0
+		if Input.is_key_pressed(KEY_LEFT): turn += 1
+		if Input.is_key_pressed(KEY_RIGHT): turn -= 1
+		if Input.is_key_pressed(KEY_UP): tilt += 1
+		if Input.is_key_pressed(KEY_DOWN): tilt -= 1
+		if turn != 0.0 or tilt != 0.0:
+			_yaw += turn * delta * 1.5
+			_pitch = clampf(_pitch + tilt * delta * 1.5, -1.3, 1.3)
+			_cam.rotation = Vector3(_pitch, _yaw, 0)
+
+		# WASD walks on the horizontal plane in the facing direction; U/J move along world Y.
 		var move := Vector3.ZERO
 		if Input.is_key_pressed(KEY_W): move.z -= 1
 		if Input.is_key_pressed(KEY_S): move.z += 1
 		if Input.is_key_pressed(KEY_A): move.x -= 1
 		if Input.is_key_pressed(KEY_D): move.x += 1
-		if Input.is_key_pressed(KEY_Q): move.y -= 1
-		if Input.is_key_pressed(KEY_E): move.y += 1
+		if Input.is_key_pressed(KEY_U): move.y += 1
+		if Input.is_key_pressed(KEY_J): move.y -= 1
 		if move != Vector3.ZERO:
-			_cam.position += (Basis(Vector3.UP, _yaw) * move.normalized()) * delta * 2.0
+			var speed := FLY_SPEED * (4.0 if Input.is_key_pressed(KEY_SHIFT) else 1.0)
+			_cam.position += (Basis(Vector3.UP, _yaw) * move.normalized()) * delta * speed
 
 	for p in _pointers:
 		_update_pointer(p)
@@ -449,13 +501,16 @@ func _update_pointer(p: Dictionary) -> void:
 		b.mat.albedo_color = COL_BTN_HOVER if hover else COL_BTN
 
 
-func _hit(origin: Vector3, dir: Vector3) -> Dictionary:
+func _hit(world_origin: Vector3, world_dir: Vector3) -> Dictionary:
 	var best := {}
+	# Console hits are worked out in the console's own space, where its panel is z = PANEL_Z.
+	var origin := _console.to_local(world_origin)
+	var dir := _console.global_basis.inverse() * world_dir
 	if absf(dir.z) > 1e-5:
 		var t := (PANEL_Z - origin.z) / dir.z
 		if t > 0.0:
 			var pt := origin + dir * t
-			var uv: Vector2 = pad.uv_at(pt)
+			var uv: Vector2 = pad.uv_at(_console.to_global(pt))
 			if uv.x >= 0.0:
 				best = {"t": t, "kind": "pad", "uv": uv}
 			else:
@@ -468,7 +523,14 @@ func _hit(origin: Vector3, dir: Vector3) -> Dictionary:
 			# Keep reporting a scrub position while dragging past the bar ends.
 			if not best.has("frac"):
 				best["frac"] = clampf((pt.x - BAR_X0) / (BAR_X1 - BAR_X0), 0.0, 1.0)
-	var n: Dictionary = view.pick(origin, dir)
+	# Drawing straight onto the input slice.
+	var s: Dictionary = view.input_hit(world_origin, world_dir)
+	if not s.is_empty() and (not best.has("kind") or s.t < best.t):
+		var f0 = best.get("frac")
+		best = {"t": s.t, "kind": "pad", "uv": s.uv}
+		if f0 != null:
+			best["frac"] = f0
+	var n: Dictionary = view.pick(world_origin, world_dir)
 	if not n.is_empty() and (not best.has("kind") or n.t < best.t):
 		var f = best.get("frac")
 		best = {"t": n.t, "kind": "node", "layer": n.layer, "neuron": n.neuron}
@@ -503,7 +565,6 @@ func _on_json(msg: Dictionary) -> void:
 		"timeline":
 			steps = msg["steps"]
 			accuracy = msg["accuracy"]
-			view.set_extent(msg["extent"])
 			recording = false
 			_jump_on_meta = true
 			_rebuild_spark()
@@ -522,6 +583,9 @@ func _on_json(msg: Dictionary) -> void:
 					playing = true
 			view.apply_meta(msg)
 			_drawn = msg.get("drawn", false)
+			center = msg.get("center", false)
+			view.set_center(center)
+			_button("center").label.text = "Stop helping" if center else "Help: centre it"
 			if _pulse_on_meta:
 				_pulse_on_meta = false
 				view.pulse()
@@ -560,25 +624,38 @@ func _speed_text() -> String:
 
 # ------------------------------------------------------------------ testing helper
 
+func _vec3_arg(text: String) -> Vector3:
+	var p := text.split(",")
+	return Vector3(float(p[0]), float(p[1]), float(p[2]))
+
+
 func _run_screenshot_demo() -> void:
 	var t0 := Time.get_ticks_msec()
-	while steps.is_empty() and Time.get_ticks_msec() - t0 < 10000:
+	# Wait for the first snapshot too: its arrival sets the playhead, which would undo --at.
+	while (steps.is_empty() or shown_index < 0) and Time.get_ticks_msec() - t0 < 10000:
 		await get_tree().process_frame
 	if screenshot_at >= 0:
 		playhead = float(screenshot_at)
 	_set_camera_view(screenshot_view)
+	if screenshot_cam != null:
+		_cam.position = view.to_global(screenshot_cam)
+		_cam.look_at(view.to_global(screenshot_look if screenshot_look != null else Vector3(0, NetworkView.GRID_Y, NetworkView.MID_Z)))
+	if screenshot_center:
+		client.send({"type": "center", "on": true})
 	pad.begin_stroke(Vector2(0.28, 0.25))
 	pad.continue_stroke(Vector2(0.72, 0.24))
 	pad.continue_stroke(Vector2(0.52, 0.55))
 	pad.continue_stroke(Vector2(0.44, 0.8))
 	pad.end_stroke()
+	if screenshot_select.x > 0:
+		view.select(screenshot_select.x, screenshot_select.y)
 	for i in 90:
 		await get_tree().process_frame
 	if screenshot_pulse >= 0.0:
 		# Freeze the pulse part-way through.
 		view.pulse_speed = 0.0
 		view.pulse_t = screenshot_pulse
-		view.edge_mat.set_shader_parameter("pulse_t", screenshot_pulse)
+		view.set_edge_param("pulse_t", screenshot_pulse)
 		view._recolor()
 		for i in 5:
 			await get_tree().process_frame

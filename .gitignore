@@ -1,0 +1,11 @@
+# Python
+server/.venv/
+__pycache__/
+*.pyc
+
+# MNIST download (fetched automatically on first run)
+server/data/
+
+# Godot cache and exports
+godot/.godot/
+export/
